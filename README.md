@@ -12,25 +12,34 @@ memory, so it asks the price APIs once however many people want a price. It serv
 What the website needs, as [`docs/api-v1.md`](./docs/api-v1.md) specifies. The website reads the service's
 url from its build's `OC_PRICE_SERVICE_URL`.
 
-- **`GET /v1/prices`:** the latest USD prices, ~25 KB (~9 KB compressed). `timestamp` is when they
+- **`GET /v1/prices`:** the latest USD prices, ~30 KB (~9 KB compressed). `timestamp` is when they
   were refreshed.
   - **`prices`:** every token OpenChat's Registry lists which has a price, keyed by ledger.
   - **`coins`:** the 250 largest coins on CoinGecko, keyed by symbol in upper case. Symbols OpenChat
     lists are left out, so a symbol means one token, eg. `ICP` is only in `prices`. Each has its
     CoinGecko `id`, for its history.
   - **When coins are stale:** `coins` is left out, rather than failing the whole response.
+  - **`source`:** where each price is from, `icpswap` or `coingecko`. Stablecoins have none, as
+    they're priced at $1.
+  - **`sources`:** each source's `name` and `url`, and whether its prices must be credited where
+    they're shown (`attribution_required`). CoinGecko's must be, as its free API requires, eg.
+    "Price data by CoinGecko" linking to its `url`, close to the price. See
+    [the spec](./docs/api-v1.md#additions-where-prices-come-from-and-crediting-coingecko).
 
   ```json
   { "timestamp": 1792937761959,
-    "prices": { "2ouva-viaaa-aaaaq-aaamq-cai": { "usd": 0.0308548 } },
-    "coins": { "ADA": { "id": "cardano", "name": "Cardano", "usd": 0.204927 } } }
+    "prices": { "2ouva-viaaa-aaaaq-aaamq-cai": { "usd": 0.0308548, "source": "icpswap" } },
+    "coins": { "ADA": { "id": "cardano", "name": "Cardano", "usd": 0.204927, "source": "coingecko" } },
+    "sources": {
+      "coingecko": { "name": "CoinGecko", "url": "https://www.coingecko.com", "attribution_required": true },
+      "icpswap": { "name": "ICPSwap", "url": "https://www.icpswap.com", "attribution_required": false } } }
   ```
 
 - **`GET /v1/prices/{ledger}/history?range=7d`:** one token's hourly closes, oldest first, as
   `[timestamp, usd]` points, for a chart. `range=1d` works too. ~6 KB for a week.
 
   ```json
-  { "ledger": "2ouva-viaaa-aaaaq-aaamq-cai", "range": "7d", "interval": "1h",
+  { "ledger": "2ouva-viaaa-aaaaq-aaamq-cai", "source": "icpswap", "range": "7d", "interval": "1h",
     "points": [[1792332992198, 0.0327586], [1792335560000, 0.0331021], [1792937761959, 0.0308548]] }
   ```
 
@@ -104,6 +113,8 @@ found, or there aren't enough prices for it, only whoever ran the command is tol
   - OpenChat gives a bot an upload allowance of 1 GB when it's registered. A chart is about
     40-90 KB, so that's roughly 15,000 charts, after which uploads fail.
   - A group's or community's files are only deleted with it.
+- **Credits:** the chart's footer names where its prices are from. When CoinGecko's are charted,
+  the caption ends with "Price data by CoinGecko", linked, as CoinGecko's free API requires.
 
 ## Where ChartBot's prices come from
 
@@ -207,7 +218,7 @@ or ECS, rather than Lambda, so its cache is shared. It needs:
 | Variable | |
 |---|---|
 | `OC_IDENTITY_PEM` or `OC_IDENTITY_PEM_FILE` | The bot's identity, as PEM text, eg. from `dfx identity export`, or a file |
-| `COINGECKO_API_KEY` | Optional, but worth having in production. A CoinGecko Demo API key, which is free, for a higher rate limit than its public API's. The coins' refresh uses about 7,200 of its 10,000 calls a month. |
+| `COINGECKO_API_KEY` | Optional, but worth having in production. A CoinGecko Demo API key, which is free, for a higher rate limit than its public API's. The coins' refresh uses about 7,200 of its 10,000 calls a month. Its prices must be credited where they're shown, which the API's `sources` says. |
 | `PORT` | Defaults to 3000, or 8080 in the container |
 | `OC_IC_URL`, `OC_PUBLIC_KEY`, `OC_STORAGE_INDEX` | Only to use an OpenChat other than mainnet's |
 | `LEDGER_ALIASES` | Only locally: `local=mainnet` ledger pairs, separated by commas, to price local ledgers as mainnet ones |

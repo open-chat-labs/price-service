@@ -1,13 +1,14 @@
 //! The prices OpenChat's website shows: every USD value, and cashtags' charts, for the tokens
 //! OpenChat lists and for the largest other coins, eg. ADA. See the README.
 
-use crate::prices::{Market, MarketHistory, Period, now};
+use crate::prices::{Market, MarketHistory, Period, Provider, now};
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use ic_agent::export::Principal;
+use oc_bots_sdk::types::CanisterId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -30,11 +31,16 @@ struct PricesResponse {
     /// while they're stale.
     #[serde(skip_serializing_if = "Option::is_none")]
     coins: Option<BTreeMap<String, CoinPrice>>,
+    /// Where the prices come from, by the `source` the prices and histories give
+    sources: BTreeMap<&'static str, SourceInfo>,
 }
 
 #[derive(Serialize)]
 struct TokenPrice {
     usd: f64,
+    /// Left out for stablecoins, which are priced at $1 rather than from a source
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -43,6 +49,16 @@ struct CoinPrice {
     id: String,
     name: String,
     usd: f64,
+    source: &'static str,
+}
+
+#[derive(Serialize)]
+struct SourceInfo {
+    name: &'static str,
+    url: &'static str,
+    /// Its prices must be credited, eg. "Price data by CoinGecko" linking to `url`, wherever
+    /// they're shown
+    attribution_required: bool,
 }
 
 #[derive(Deserialize)]
@@ -56,6 +72,8 @@ struct HistoryResponse {
     ledger: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'static str>,
     range: &'static str,
     interval: &'static str,
     /// [timestamp, usd], oldest first
@@ -71,7 +89,13 @@ async fn prices(State(market): State<Arc<Market>>) -> Response {
     let prices = latest
         .prices
         .iter()
-        .map(|(ledger, usd)| (ledger.to_string(), TokenPrice { usd: *usd }))
+        .map(|(ledger, usd)| {
+            let price = TokenPrice {
+                usd: *usd,
+                source: icpswap_unless_pinned(&market, *ledger),
+            };
+            (ledger.to_string(), price)
+        })
         .collect();
     let coins = market.coins(now).map(|coins| {
         coins
@@ -82,6 +106,7 @@ async fn prices(State(market): State<Arc<Market>>) -> Response {
                     id: coin.id.clone(),
                     name: coin.name.clone(),
                     usd: coin.usd,
+                    source: Provider::CoinGecko.id(),
                 };
                 (symbol.clone(), price)
             })
@@ -92,6 +117,7 @@ async fn prices(State(market): State<Arc<Market>>) -> Response {
             timestamp: latest.timestamp,
             prices,
             coins,
+            sources: sources(),
         },
         60,
     )
@@ -109,8 +135,10 @@ async fn history(
     let Ok(canister_id) = Principal::from_text(&ledger) else {
         return error(StatusCode::NOT_FOUND, "Unknown ledger");
     };
-    let history = market.history(canister_id.into(), period, now());
-    history_response(history, range, Some(ledger), None, "Unknown ledger")
+    let canister_id = canister_id.into();
+    let history = market.history(canister_id, period, now());
+    let source = icpswap_unless_pinned(&market, canister_id);
+    history_response(history, range, Some(ledger), None, source, "Unknown ledger")
 }
 
 // One of the largest coins' prices over a recent range, by CoinGecko's id
@@ -123,7 +151,27 @@ async fn coin_history(
         return unsupported_range();
     };
     let history = market.coin_history(&id, period, now());
-    history_response(history, range, None, Some(id), "Unknown coin")
+    let source = Some(Provider::CoinGecko.id());
+    history_response(history, range, None, Some(id), source, "Unknown coin")
+}
+
+// Stablecoins are priced at $1, so their prices have no source
+fn icpswap_unless_pinned(market: &Market, ledger: CanisterId) -> Option<&'static str> {
+    (!market.is_pinned(ledger)).then_some(Provider::IcpSwap.id())
+}
+
+fn sources() -> BTreeMap<&'static str, SourceInfo> {
+    Provider::ALL
+        .into_iter()
+        .map(|provider| {
+            let info = SourceInfo {
+                name: provider.name(),
+                url: provider.url(),
+                attribution_required: provider.attribution_required(),
+            };
+            (provider.id(), info)
+        })
+        .collect()
 }
 
 fn range(query: &HistoryQuery) -> Option<(&'static str, Period)> {
@@ -143,6 +191,7 @@ fn history_response(
     range: &'static str,
     ledger: Option<String>,
     id: Option<String>,
+    source: Option<&'static str>,
     unknown: &str,
 ) -> Response {
     match history {
@@ -150,6 +199,7 @@ fn history_response(
             HistoryResponse {
                 ledger,
                 id,
+                source,
                 range,
                 interval: "1h",
                 points: points.into_iter().map(|p| (p.time, p.price)).collect(),

@@ -182,16 +182,18 @@ mod tests {
     const CHAT: &str = "2ouva-viaaa-aaaaq-aaamq-cai";
     const ICP: &str = "ryjl3-tyaaa-aaaaa-aaaba-cai";
     const UNLISTED: &str = "73mez-iiaaa-aaaaq-aaasq-cai";
+    const CKUSDC: &str = "xevnm-gaaaa-aaaar-qafnq-cai";
 
     fn ledger(text: &str) -> oc_bots_sdk::types::CanisterId {
         Principal::from_text(text).unwrap().into()
     }
 
-    // CHAT is listed and priced, with an hour's close, and ICP is listed but has no closes yet
+    // CHAT is listed and priced, with an hour's close, ICP is listed but has no closes yet, and
+    // ckUSDC is a stablecoin
     fn market() -> Arc<Market> {
         let market = Arc::new(Market::new(HashMap::new()));
         market.set_listed(
-            [(CHAT, "CHAT"), (ICP, "ICP")]
+            [(CHAT, "CHAT"), (ICP, "ICP"), (CKUSDC, "ckUSDC")]
                 .into_iter()
                 .map(|(text, symbol)| ListedToken {
                     ledger: ledger(text),
@@ -251,8 +253,36 @@ mod tests {
         assert!(body["timestamp"].as_u64().unwrap() > 1_700_000_000_000);
         assert_eq!(
             body["prices"],
-            serde_json::json!({ CHAT: { "usd": 0.0281335 } })
+            serde_json::json!({
+                CHAT: { "usd": 0.0281335, "source": "icpswap" },
+                CKUSDC: { "usd": 1.0 },
+            })
         );
+    }
+
+    #[tokio::test]
+    async fn prices_say_where_theyre_from_and_which_sources_must_be_credited() {
+        let body = json(get(market(), "/v1/prices").await).await;
+        assert_eq!(
+            body["sources"],
+            serde_json::json!({
+                "coingecko": {
+                    "name": "CoinGecko",
+                    "url": "https://www.coingecko.com",
+                    "attribution_required": true,
+                },
+                "icpswap": {
+                    "name": "ICPSwap",
+                    "url": "https://www.icpswap.com",
+                    "attribution_required": false,
+                },
+            })
+        );
+
+        let body =
+            json(get(market(), &format!("/v1/prices/{CKUSDC}/history?range=1d")).await).await;
+        assert!(body.get("source").is_none());
+        assert_eq!(body["points"][0][1], 1.0);
     }
 
     #[tokio::test]
@@ -279,6 +309,7 @@ mod tests {
         );
         let body = json(response).await;
         assert_eq!(body["ledger"], CHAT);
+        assert_eq!(body["source"], "icpswap");
         assert_eq!(body["range"], "7d");
         assert_eq!(body["interval"], "1h");
         let points = body["points"].as_array().unwrap();
@@ -357,7 +388,9 @@ mod tests {
         let body = json(get(market.clone(), "/v1/prices").await).await;
         assert_eq!(
             body["coins"],
-            serde_json::json!({ "ADA": { "id": "cardano", "name": "Cardano", "usd": 0.204964 } })
+            serde_json::json!({
+                "ADA": { "id": "cardano", "name": "Cardano", "usd": 0.204964, "source": "coingecko" }
+            })
         );
 
         let response = get(market.clone(), "/v1/coins/cardano/history?range=7d").await;
@@ -369,6 +402,7 @@ mod tests {
         let body = json(response).await;
         assert_eq!(body["id"], "cardano");
         assert!(body.get("ledger").is_none());
+        assert_eq!(body["source"], "coingecko");
         assert_eq!(body["interval"], "1h");
         let prices: Vec<f64> = body["points"]
             .as_array()

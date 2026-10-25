@@ -52,11 +52,52 @@ pub enum Source {
 }
 
 impl Source {
-    pub fn name(&self) -> &'static str {
+    pub fn provider(&self) -> Provider {
         match self {
-            Source::Icp(_) => "ICPSwap",
-            Source::CoinGecko(_) => "CoinGecko",
+            Source::Icp(_) => Provider::IcpSwap,
+            Source::CoinGecko(_) => Provider::CoinGecko,
         }
+    }
+}
+
+/// A service the prices come from, and how it's credited where they're shown
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provider {
+    IcpSwap,
+    CoinGecko,
+}
+
+impl Provider {
+    pub const ALL: [Provider; 2] = [Provider::IcpSwap, Provider::CoinGecko];
+
+    /// How the price API refers to it
+    pub fn id(self) -> &'static str {
+        match self {
+            Provider::IcpSwap => "icpswap",
+            Provider::CoinGecko => "coingecko",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Provider::IcpSwap => "ICPSwap",
+            Provider::CoinGecko => "CoinGecko",
+        }
+    }
+
+    /// Where a credit links to
+    pub fn url(self) -> &'static str {
+        match self {
+            Provider::IcpSwap => "https://www.icpswap.com",
+            Provider::CoinGecko => "https://www.coingecko.com",
+        }
+    }
+
+    /// Whether its prices must be credited, with a link, wherever they're shown. CoinGecko's free
+    /// API requires it, eg. "Price data by CoinGecko", close to the prices:
+    /// https://brand.coingecko.com/resources/attribution-guide
+    pub fn attribution_required(self) -> bool {
+        matches!(self, Provider::CoinGecko)
     }
 }
 

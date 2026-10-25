@@ -336,7 +336,7 @@ fn draw_footer(area: &DrawingArea<SVGBackend, Shift>, sources: &[&str]) -> Resul
     let text = if sources.is_empty() {
         "Times in UTC".to_string()
     } else {
-        format!("Times in UTC · Prices from {}", sources.join(", "))
+        format!("Times in UTC · Price data by {}", sources.join(" and "))
     };
     let style = font(24, FontStyle::Normal).color(&MUTED_INK);
     let width = text_width(&text, 24, FontStyle::Normal);

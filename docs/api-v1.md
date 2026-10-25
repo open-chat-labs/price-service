@@ -136,6 +136,34 @@ v1, which a frontend that doesn't know them ignores. The website doesn't use the
 - **Refresh:** both come from one CoinGecko call every 6 minutes, so `/v1/prices` grows to ~25 KB
   (~9 KB compressed).
 
+## Additions: where prices come from, and crediting CoinGecko
+CoinGecko's free API requires its data to be credited wherever it's shown. So every price says
+where it's from, and the website credits the source beside it. These are additions to v1 too.
+
+- **`source`** is on each entry in `prices` and `coins`, and on each history: `icpswap` or
+  `coingecko`. Stablecoins have none, as they're priced at $1.
+- **`sources`**, in `/v1/prices`, describes each one:
+
+  ```json
+  "sources": {
+    "coingecko": { "name": "CoinGecko", "url": "https://www.coingecko.com", "attribution_required": true },
+    "icpswap": { "name": "ICPSwap", "url": "https://www.icpswap.com", "attribution_required": false }
+  }
+  ```
+
+- **Where `attribution_required` is true**, the website credits the source wherever it shows
+  those prices:
+  - visibly, close to the prices, eg. just below a cashtag card's chart;
+  - in one of CoinGecko's wordings, eg. "Price data by CoinGecko";
+  - linking to `url`.
+  - Not once per price: CoinGecko asks not to overload a page with credits. How to credit the
+    prices on cashtag chips in a message is the website's call.
+  - It mustn't suggest a partnership or endorsement, eg. "Our partner CoinGecko". See CoinGecko's
+    [attribution guide](https://brand.coingecko.com/resources/attribution-guide).
+- **So today only `coins` need a credit.** ICPSwap doesn't ask for one, so crediting it is
+  optional.
+- **Size:** `/v1/prices` grows to ~30 KB, and is still ~9 KB compressed.
+
 ## Exactly what the frontend parses
 These are the frontend mappers, `frontend/openchat-agent/src/services/priceService/mappers.ts`.
 - **`/v1/prices`**
