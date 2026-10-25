@@ -108,6 +108,34 @@ One token's prices over a recent range, for a chart.
 - **Caching**: `Cache-Control: public, max-age=300`. The browser's HTTP cache then serves a card
   reopened within 5 minutes without a request.
 
+## Additions: the largest coins OpenChat doesn't list
+So that cashtags like `$ADA`, `$NEAR` or `$BNB` can show a price and a chart. These are additions to
+v1, which a frontend that doesn't know them ignores. The website doesn't use them yet.
+
+- **`GET /v1/prices`** gains **`coins`**:
+  - It holds the 250 largest coins on CoinGecko, keyed by symbol in **upper case**.
+  - Symbols OpenChat's Registry lists are left out, so a cashtag's symbol means one token. A
+    Registry token is looked up in `prices`, and any other symbol in `coins`.
+  - Where two coins share a symbol, the larger one is kept.
+  - Each coin has its CoinGecko `id` (for its history), `name` and `usd`.
+  - When the coins are more than an hour old, `coins` is left out, and `prices` is still served.
+
+  ```json
+  "coins": { "ADA": { "id": "cardano", "name": "Cardano", "usd": 0.204927 } }
+  ```
+
+- **`GET /v1/coins/{id}/history?range=7d`** is a coin's history, by its `id`. It has the same
+  shape, ranges and statuses as a ledger's, with `id` in place of `ledger`.
+  - The points are CoinGecko's hourly prices over the last week, ending with the latest price.
+  - A coin that isn't among the largest is a **404**.
+
+  ```json
+  { "id": "cardano", "range": "7d", "interval": "1h", "points": [[1792358070496, 0.21306], [1792962772000, 0.204927]] }
+  ```
+
+- **Refresh:** both come from one CoinGecko call every 6 minutes, so `/v1/prices` grows to ~25 KB
+  (~9 KB compressed).
+
 ## Exactly what the frontend parses
 These are the frontend mappers, `frontend/openchat-agent/src/services/priceService/mappers.ts`.
 - **`/v1/prices`**

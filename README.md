@@ -4,7 +4,7 @@ Token prices for [OpenChat](https://oc.app). It's one long-running container tha
 memory, so it asks the price APIs once however many people want a price. It serves:
 
 - **[The price API](#price-api)**, which OpenChat's website reads every USD value from, and cashtags'
-  charts (`$CHAT` in a message).
+  charts (`$CHAT` in a message), for the tokens OpenChat lists and the largest other coins, eg. ADA.
 - **[ChartBot](#chartbot)**, an OpenChat bot which replies to `/chart` with a price chart.
 
 ## Price API
@@ -12,11 +12,18 @@ memory, so it asks the price APIs once however many people want a price. It serv
 What the website needs, as [`docs/api-v1.md`](./docs/api-v1.md) specifies. The website reads the service's
 url from its build's `OC_PRICE_SERVICE_URL`.
 
-- **`GET /v1/prices`:** the latest USD price of every token OpenChat's Registry lists which has
-  one, keyed by ledger, ~7.5 KB (~3 KB compressed). `timestamp` is when they were refreshed.
+- **`GET /v1/prices`:** the latest USD prices, ~25 KB (~9 KB compressed). `timestamp` is when they
+  were refreshed.
+  - **`prices`:** every token OpenChat's Registry lists which has a price, keyed by ledger.
+  - **`coins`:** the 250 largest coins on CoinGecko, keyed by symbol in upper case. Symbols OpenChat
+    lists are left out, so a symbol means one token, eg. `ICP` is only in `prices`. Each has its
+    CoinGecko `id`, for its history.
+  - **When coins are stale:** `coins` is left out, rather than failing the whole response.
 
   ```json
-  { "timestamp": 1792937761959, "prices": { "2ouva-viaaa-aaaaq-aaamq-cai": { "usd": 0.0308548 } } }
+  { "timestamp": 1792937761959,
+    "prices": { "2ouva-viaaa-aaaaq-aaamq-cai": { "usd": 0.0308548 } },
+    "coins": { "ADA": { "id": "cardano", "name": "Cardano", "usd": 0.204927 } } }
   ```
 
 - **`GET /v1/prices/{ledger}/history?range=7d`:** one token's hourly closes, oldest first, as
@@ -27,6 +34,8 @@ url from its build's `OC_PRICE_SERVICE_URL`.
     "points": [[1792332992198, 0.0327586], [1792335560000, 0.0331021], [1792937761959, 0.0308548]] }
   ```
 
+  - **`GET /v1/coins/{id}/history?range=7d`** is the same for one of the coins, by its CoinGecko
+    id, with `id` in place of `ledger`.
   - **The first point** is the price at the start of the range: the last close before it.
   - **The last point** is the latest price, the one `/v1/prices` gives, so the two agree.
   - **Gaps:** an hour without trades has no point.
@@ -34,7 +43,8 @@ url from its build's `OC_PRICE_SERVICE_URL`.
     just its start and its latest price.
 - **Statuses:**
   - **400** for a range other than `1d` or `7d`.
-  - **404** for a ledger the Registry doesn't list, or any other path.
+  - **404** for a ledger the Registry doesn't list, a coin that isn't among the largest, or any
+    other path.
   - **503** when prices are more than an hour old, or haven't loaded yet. The website then keeps
     the prices it has.
   - Errors are `{ "error": "<message>" }`.
@@ -49,7 +59,10 @@ url from its build's `OC_PRICE_SERVICE_URL`.
   - **OpenChat's tokens:** the Registry, hourly.
   - **Latest prices:** ICPSwap's `/token/all`, every minute.
   - **Hourly closes:** each token's, every 15 minutes. They're fetched two at a time, busiest
-    first, which gets through all ~140 tokens in about 10 minutes after a start.
+    first, which gets through all ~140 tokens in about 4-10 minutes after a start.
+  - **Coins:** CoinGecko's 250 largest, with each one's hourly prices over the last week (its
+    "sparkline"), every 6 minutes in a single call. That's about 7,200 calls a month, inside a free
+    Demo key's 10,000.
   - A token's history is a 503 until its closes have loaded.
 - **Stablecoins** are priced at $1, as their ICPSwap pools have next to no liquidity: ckUSDC,
   ckUSDT, and OneSec's USDC and USDT.
@@ -111,10 +124,11 @@ API in [`src/api.rs`](./src/api.rs), and the bot in [`src/chart_bot`](./src/char
   - The price at the start of a period is the last one before it, as a token which trades rarely
     may have gaps.
 - **Caching and limits:** everything is cached in memory, so a restart starts cold.
-  - Tokens OpenChat lists are charted from the price API's prices for 1d and 7d.
+  - Tokens OpenChat lists, and the 250 largest coins, are charted from the price API's prices for
+    1d and 7d. The coins also resolve symbols without a call.
   - Other prices are cached for 5 minutes for 1d, 15 minutes for 7d and an hour beyond.
-  - Which token a symbol means is cached for an hour. OpenChat's token list is fetched hourly, and
-    CoinGecko's 250 largest coins daily, so most symbols are found without asking CoinGecko.
+  - Which token a symbol means is cached for an hour. Only a symbol outside OpenChat's tokens and the
+    250 largest coins asks CoinGecko.
   - Without an API key, CoinGecko allows only a few calls a minute from an address. The service
     stays under 10 a minute, or 30 with a key, and says so if it's asked for more.
   - ICPSwap's charts are slow, often 3-20 seconds. So the service makes at most 4 requests to
@@ -193,7 +207,7 @@ or ECS, rather than Lambda, so its cache is shared. It needs:
 | Variable | |
 |---|---|
 | `OC_IDENTITY_PEM` or `OC_IDENTITY_PEM_FILE` | The bot's identity, as PEM text, eg. from `dfx identity export`, or a file |
-| `COINGECKO_API_KEY` | Optional, but worth having in production. A CoinGecko Demo API key, which is free, for a higher rate limit than its public API's. |
+| `COINGECKO_API_KEY` | Optional, but worth having in production. A CoinGecko Demo API key, which is free, for a higher rate limit than its public API's. The coins' refresh uses about 7,200 of its 10,000 calls a month. |
 | `PORT` | Defaults to 3000, or 8080 in the container |
 | `OC_IC_URL`, `OC_PUBLIC_KEY`, `OC_STORAGE_INDEX` | Only to use an OpenChat other than mainnet's |
 | `LEDGER_ALIASES` | Only locally: `local=mainnet` ledger pairs, separated by commas, to price local ledgers as mainnet ones |
