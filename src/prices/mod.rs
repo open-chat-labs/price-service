@@ -1,20 +1,25 @@
-use anyhow::Result;
+use anyhow::anyhow;
 use cache::Cache;
 use coingecko::CoinGecko;
-use ic_agent::Agent;
-use icpswap::IcpSwap;
-use oc_bots_sdk::mainnet::mainnet_ic_url;
+use market::History;
 use oc_bots_sdk::types::{CanisterId, TimestampMillis};
 use registry::ListedToken;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod cache;
 mod coingecko;
 mod icpswap;
+mod market;
+mod outliers;
 mod period;
+mod refresh;
 mod registry;
 
+pub use icpswap::IcpSwap;
+pub use market::{History as MarketHistory, Market};
 pub use period::Period;
+pub use refresh::spawn as spawn_refresh;
 
 const HOUR: Duration = Duration::from_secs(60 * 60);
 
@@ -64,28 +69,30 @@ impl From<anyhow::Error> for PriceError {
     }
 }
 
+/// Prices for ChartBot, which can chart any token. Those OpenChat lists come from the market, as
+/// far back as it goes, and otherwise from their source.
 pub struct Prices {
-    // Anonymous, for mainnet's Registry
-    mainnet: Agent,
+    market: Arc<Market>,
     coingecko: CoinGecko,
-    icpswap: IcpSwap,
-    listed: Cache<(), Vec<ListedToken>>,
+    icpswap: Arc<IcpSwap>,
     found: Cache<String, Option<Token>>,
     histories: Cache<(Source, Period), Vec<PricePoint>>,
 }
 
 impl Prices {
-    pub fn new(coingecko_api_key: Option<String>) -> Result<Self> {
-        let http = http_client()?;
-
-        Ok(Prices {
-            mainnet: Agent::builder().with_url(mainnet_ic_url()).build()?,
-            coingecko: CoinGecko::new(http.clone(), coingecko_api_key),
-            icpswap: IcpSwap::new(http),
-            listed: Cache::default(),
+    pub fn new(
+        http: reqwest::Client,
+        coingecko_api_key: Option<String>,
+        market: Arc<Market>,
+        icpswap: Arc<IcpSwap>,
+    ) -> Self {
+        Prices {
+            market,
+            coingecko: CoinGecko::new(http, coingecko_api_key),
+            icpswap,
             found: Cache::default(),
             histories: Cache::default(),
-        })
+        }
     }
 
     /// The token the symbol most likely means: one OpenChat lists, else the one with the largest
@@ -96,7 +103,11 @@ impl Prices {
             return Ok(token);
         }
 
-        let token = match find_listed(&self.listed_tokens().await?, symbol) {
+        let listed = self
+            .market
+            .listed()
+            .ok_or_else(|| anyhow!("OpenChat's tokens haven't loaded yet"))?;
+        let token = match find_listed(&listed.tokens, symbol) {
             Some(token) => Some(token),
             None => self.coingecko.find(symbol).await?.map(|coin| Token {
                 symbol: coin.symbol.to_uppercase(),
@@ -115,13 +126,20 @@ impl Prices {
         token: &Token,
         period: Period,
     ) -> Result<Vec<PricePoint>, PriceError> {
+        if let Source::Icp(ledger) = token.source
+            && (period.days() <= 7 || self.market.is_pinned(ledger))
+            && let History::Points(points) = self.market.history(ledger, period, now())
+        {
+            return Ok(points);
+        }
+
         let key = (token.source.clone(), period);
         if let Some(points) = self.histories.get(&key) {
             return Ok(points);
         }
 
         let points = match &token.source {
-            Source::Icp(ledger) => self.icpswap.history(*ledger, period).await?,
+            Source::Icp(ledger) => outliers::filter(self.icpswap.history(*ledger, period).await?),
             Source::CoinGecko(id) => self.coingecko.history(id, period).await?,
         };
         let points = within_period(points, period, now());
@@ -130,29 +148,24 @@ impl Prices {
             .insert(key, points.clone(), cache_duration(period));
         Ok(points)
     }
-
-    async fn listed_tokens(&self) -> Result<Vec<ListedToken>, PriceError> {
-        if let Some(tokens) = self.listed.get(&()) {
-            return Ok(tokens);
-        }
-        let tokens = registry::listed_tokens(&self.mainnet).await?;
-        self.listed.insert((), tokens.clone(), HOUR);
-        Ok(tokens)
-    }
 }
 
-fn http_client() -> reqwest::Result<reqwest::Client> {
+pub fn http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         // CoinGecko refuses requests without one
-        .user_agent("OpenChat ChartBot")
+        .user_agent("OpenChat price-service")
         .build()
 }
 
+// Enabled tokens first, as several share a symbol
 fn find_listed(tokens: &[ListedToken], symbol: &str) -> Option<Token> {
+    let matches = |t: &&ListedToken| t.symbol.eq_ignore_ascii_case(symbol);
     tokens
         .iter()
-        .find(|t| t.symbol.eq_ignore_ascii_case(symbol))
+        .filter(|t| t.enabled)
+        .find(matches)
+        .or_else(|| tokens.iter().find(matches))
         .map(|t| Token {
             symbol: t.symbol.clone(),
             name: t.name.clone(),
@@ -187,7 +200,7 @@ fn within_period(points: Vec<PricePoint>, period: Period, now: TimestampMillis) 
         .collect()
 }
 
-fn now() -> TimestampMillis {
+pub fn now() -> TimestampMillis {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -208,12 +221,31 @@ mod tests {
             ledger: chat,
             symbol: "ckBTC".to_string(),
             name: "ckBTC".to_string(),
+            enabled: true,
         }];
 
         let token = find_listed(&tokens, "CKBTC").unwrap();
         assert_eq!(token.symbol, "ckBTC");
         assert_eq!(token.source, Source::Icp(chat));
         assert!(find_listed(&tokens, "BTC").is_none());
+    }
+
+    #[test]
+    fn enabled_tokens_are_found_before_disabled_ones_with_the_same_symbol() {
+        let ledger = |text: &str| -> CanisterId { Principal::from_text(text).unwrap().into() };
+        let sneed = |ledger: CanisterId, enabled: bool| ListedToken {
+            ledger,
+            symbol: "SNEED".to_string(),
+            name: "Sneed".to_string(),
+            enabled,
+        };
+        let old = ledger("2ouva-viaaa-aaaaq-aaamq-cai");
+        let new = ledger("ryjl3-tyaaa-aaaaa-aaaba-cai");
+        let tokens = vec![sneed(old, false), sneed(new, true)];
+        assert_eq!(
+            find_listed(&tokens, "sneed").unwrap().source,
+            Source::Icp(new)
+        );
     }
 
     fn point(time: TimestampMillis, price: f64) -> PricePoint {

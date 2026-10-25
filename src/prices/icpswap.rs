@@ -2,9 +2,11 @@ use super::Period;
 use super::{PriceError, PricePoint};
 use anyhow::anyhow;
 use futures::future::try_join_all;
+use ic_agent::export::Principal;
 use oc_bots_sdk::types::CanisterId;
 use reqwest::StatusCode;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
@@ -78,8 +80,22 @@ impl IcpSwap {
         Ok(points(pages.into_iter().flatten()))
     }
 
-    // Tries again once if it's refused for too many requests, which happens now and then even to
-    // a few at once, without saying how long to wait
+    /// A token's hourly closes, oldest first, in the latest `limit` hours it was traded in
+    pub async fn hourly(
+        &self,
+        ledger: CanisterId,
+        limit: u32,
+    ) -> Result<Vec<PricePoint>, PriceError> {
+        let candles = self.chart(ledger, "h1", 1, limit).await?;
+        Ok(points(candles.into_iter()))
+    }
+
+    /// Every token's latest price, leaving out those it can't price
+    pub async fn token_prices(&self) -> Result<Vec<TokenPrice>, PriceError> {
+        let tokens: Vec<TokenSummary> = self.get("/token/all".to_string(), &[]).await?;
+        Ok(token_prices(tokens))
+    }
+
     async fn chart(
         &self,
         ledger: CanisterId,
@@ -87,27 +103,41 @@ impl IcpSwap {
         page: u32,
         limit: u32,
     ) -> Result<Vec<Candle>, PriceError> {
-        match self.chart_once(ledger, level, page, limit).await {
+        let page: Page = self
+            .get(
+                format!("/token/{ledger}/chart/{level}"),
+                &[("page", page), ("limit", limit)],
+            )
+            .await?;
+        Ok(page.content)
+    }
+
+    // Tries again once if it's refused for too many requests, which happens now and then even to
+    // a few at once, without saying how long to wait
+    async fn get<T: DeserializeOwned>(
+        &self,
+        path: String,
+        query: &[(&str, u32)],
+    ) -> Result<T, PriceError> {
+        match self.get_once(&path, query).await {
             Err(PriceError::RateLimited(_)) => {
                 tokio::time::sleep(RETRY_DELAY).await;
-                self.chart_once(ledger, level, page, limit).await
+                self.get_once(&path, query).await
             }
             result => result,
         }
     }
 
-    async fn chart_once(
+    async fn get_once<T: DeserializeOwned>(
         &self,
-        ledger: CanisterId,
-        level: &str,
-        page: u32,
-        limit: u32,
-    ) -> Result<Vec<Candle>, PriceError> {
+        path: &str,
+        query: &[(&str, u32)],
+    ) -> Result<T, PriceError> {
         let _permit = self.permits.acquire().await.map_err(anyhow::Error::from)?;
         let response = self
             .http
-            .get(format!("{BASE_URL}/token/{ledger}/chart/{level}"))
-            .query(&[("page", page), ("limit", limit)])
+            .get(format!("{BASE_URL}{path}"))
+            .query(query)
             .timeout(TIMEOUT)
             .send()
             .await
@@ -116,20 +146,19 @@ impl IcpSwap {
         match response.status() {
             StatusCode::TOO_MANY_REQUESTS => Err(PriceError::RateLimited("ICPSwap")),
             status if !status.is_success() => {
-                Err(anyhow!("ICPSwap returned {status} for {ledger}'s chart").into())
+                Err(anyhow!("ICPSwap returned {status} for {path}").into())
             }
             _ => {
-                let envelope: Envelope<Page> =
-                    response.json().await.map_err(anyhow::Error::from)?;
-                content(envelope)
+                let envelope: Envelope<T> = response.json().await.map_err(anyhow::Error::from)?;
+                data(envelope)
             }
         }
     }
 }
 
-fn content(envelope: Envelope<Page>) -> Result<Vec<Candle>, PriceError> {
+fn data<T>(envelope: Envelope<T>) -> Result<T, PriceError> {
     match (envelope.code, envelope.data) {
-        (200, Some(page)) => Ok(page.content),
+        (200, Some(data)) => Ok(data),
         (429, _) => Err(PriceError::RateLimited("ICPSwap")),
         (code, _) => Err(anyhow!(
             "ICPSwap returned {code}: {}",
@@ -137,6 +166,44 @@ fn content(envelope: Envelope<Page>) -> Result<Vec<Candle>, PriceError> {
         )
         .into()),
     }
+}
+
+/// A token's latest price on ICPSwap, and how much is in its pools
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenPrice {
+    pub ledger: CanisterId,
+    pub usd: f64,
+    pub tvl_usd: f64,
+}
+
+// One of /token/all's tokens. Its numbers are decimal strings, and a price of "0" means it can't
+// price the token.
+#[derive(Deserialize)]
+struct TokenSummary {
+    #[serde(rename = "tokenLedgerId")]
+    ledger: String,
+    price: Option<String>,
+    #[serde(rename = "tvlUSD")]
+    tvl_usd: Option<String>,
+}
+
+fn token_prices(tokens: Vec<TokenSummary>) -> Vec<TokenPrice> {
+    tokens
+        .into_iter()
+        .filter_map(|token| {
+            let ledger = Principal::from_text(&token.ledger).ok()?.into();
+            let usd: f64 = token.price?.parse().ok()?;
+            let tvl_usd = token
+                .tvl_usd
+                .and_then(|tvl| tvl.parse().ok())
+                .unwrap_or(0.0);
+            (usd.is_finite() && usd > 0.0).then_some(TokenPrice {
+                ledger,
+                usd,
+                tvl_usd,
+            })
+        })
+        .collect()
 }
 
 // Each candle's last price, at its last trade, oldest first. Candles from before a token's USD price
@@ -174,7 +241,7 @@ mod tests {
 
     fn parse(json: &str) -> Result<Vec<PricePoint>, PriceError> {
         let envelope: Envelope<Page> = serde_json::from_str(json).unwrap();
-        content(envelope).map(|candles| points(candles.into_iter()))
+        data(envelope).map(|page| points(page.content.into_iter()))
     }
 
     #[test]
@@ -216,6 +283,52 @@ mod tests {
 
         let bad_level = r#"{"code":701,"message":"level only support h1/d1","data":null}"#;
         assert!(matches!(parse(bad_level), Err(PriceError::Other(_))));
+    }
+
+    #[test]
+    fn token_prices_leave_out_those_it_cant_price() {
+        // Trimmed from /token/all, which gives "0" for a price it doesn't know
+        let json = r#"{"code":200,"message":null,"data":[
+            {"tokenLedgerId":"2ouva-viaaa-aaaaq-aaamq-cai","tokenName":"CHAT","tokenSymbol":"CHAT","price":"0.030800119010086400","priceChange24H":"24.0929","tvlUSD":"60257.35","priceHigh24H":"0.681569537505376200"},
+            {"tokenLedgerId":"mxzaz-hqaaa-aaaar-qaada-cai","tokenName":"ckBTC","tokenSymbol":"ckBTC","price":"80670.445463354770314900","tvlUSD":"1200000.5"},
+            {"tokenLedgerId":"ryjl3-tyaaa-aaaaa-aaaba-cai","tokenName":null,"tokenSymbol":null,"price":"0.000007515611407881","tvlUSD":null},
+            {"tokenLedgerId":"73mez-iiaaa-aaaaq-aaasq-cai","tokenName":"Zero","tokenSymbol":"ZERO","price":"0.000000000000000000","tvlUSD":"1"},
+            {"tokenLedgerId":"not a principal","tokenName":"Bad","tokenSymbol":"BAD","price":"1","tvlUSD":"1"}
+        ]}"#;
+        let envelope: Envelope<Vec<TokenSummary>> = serde_json::from_str(json).unwrap();
+        let prices = token_prices(data(envelope).unwrap());
+
+        let ledger = |text: &str| -> CanisterId { Principal::from_text(text).unwrap().into() };
+        assert_eq!(
+            prices,
+            vec![
+                TokenPrice {
+                    ledger: ledger("2ouva-viaaa-aaaaq-aaamq-cai"),
+                    usd: 0.0308001190100864,
+                    tvl_usd: 60257.35,
+                },
+                TokenPrice {
+                    ledger: ledger("mxzaz-hqaaa-aaaar-qaada-cai"),
+                    usd: 80670.44546335477,
+                    tvl_usd: 1200000.5,
+                },
+                TokenPrice {
+                    ledger: ledger("ryjl3-tyaaa-aaaaa-aaaba-cai"),
+                    usd: 0.000007515611407881,
+                    tvl_usd: 0.0,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "calls ICPSwap"]
+    async fn gets_the_latest_prices() {
+        let icpswap = IcpSwap::new(crate::prices::http_client().unwrap());
+        let prices = icpswap.token_prices().await.unwrap();
+        let chat = Principal::from_text("2ouva-viaaa-aaaaq-aaamq-cai").unwrap();
+        assert!(prices.iter().any(|p| p.ledger == chat.into()));
+        assert!(prices.len() > 300, "{} prices", prices.len());
     }
 
     #[tokio::test]

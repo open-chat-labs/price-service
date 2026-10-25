@@ -8,12 +8,14 @@ use serde::{Deserialize, Serialize};
 /// OpenChat's Registry, which lists the tokens OpenChat supports
 pub const REGISTRY_CANISTER_ID: &str = "cpi5u-yiaaa-aaaar-aqw5a-cai";
 
-/// A token OpenChat supports, whose ledger is on the Internet Computer
+/// A token OpenChat lists, whose ledger is on the Internet Computer
 #[derive(Clone, Debug, PartialEq)]
 pub struct ListedToken {
     pub ledger: CanisterId,
     pub symbol: String,
     pub name: String,
+    /// Whether OpenChat offers it. A disabled token may still be in people's wallets.
+    pub enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -61,11 +63,11 @@ fn tokens(response: Response) -> Vec<ListedToken> {
             .token_details
             .unwrap_or_default()
             .into_iter()
-            .filter(|t| t.enabled)
             .map(|t| ListedToken {
                 ledger: t.ledger_canister_id,
                 symbol: t.symbol,
                 name: t.name,
+                enabled: t.enabled,
             })
             .collect(),
         Response::SuccessNoUpdates => Vec::new(),
@@ -124,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn the_registrys_enabled_tokens_are_listed() {
+    fn the_registrys_tokens_are_listed() {
         let bytes = msgpack::serialize_to_vec(FullResponse::Success(FullResult {
             last_updated: 1,
             token_details: Some(vec![
@@ -139,13 +141,24 @@ mod tests {
 
         assert_eq!(
             tokens(response),
-            vec![ListedToken {
-                ledger: Principal::from_text("2ouva-viaaa-aaaaq-aaamq-cai")
-                    .unwrap()
-                    .into(),
-                symbol: "CHAT".to_string(),
-                name: "CHAT token".to_string(),
-            }]
+            vec![
+                ListedToken {
+                    ledger: Principal::from_text("2ouva-viaaa-aaaaq-aaamq-cai")
+                        .unwrap()
+                        .into(),
+                    symbol: "CHAT".to_string(),
+                    name: "CHAT token".to_string(),
+                    enabled: true,
+                },
+                ListedToken {
+                    ledger: Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai")
+                        .unwrap()
+                        .into(),
+                    symbol: "OLD".to_string(),
+                    name: "OLD token".to_string(),
+                    enabled: false,
+                }
+            ]
         );
     }
 }
