@@ -2,7 +2,6 @@
 name = "price_service"
 version = "0.1.0"
 edition = "2024"
-license = "AGPL-3.0-only"
 
 # Token prices for OpenChat, from one long-running container that keeps them cached in memory. For
 # now it's ChartBot, which replies to /chart with a price chart. Next, it'll serve the prices that
