@@ -1,12 +1,14 @@
+use super::coingecko::CoinMarket;
 use super::icpswap::TokenPrice;
 use super::registry::ListedToken;
 use super::{Period, PricePoint, outliers, within_period};
 use ic_agent::export::Principal;
 use oc_bots_sdk::types::{CanisterId, TimestampMillis};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 const MINUTE: u64 = 60 * 1000;
+const HOUR: u64 = 60 * MINUTE;
 /// Prices aren't served once this long has passed since they were last refreshed
 pub const STALE_AFTER: u64 = 60 * MINUTE;
 /// How often each token's hourly closes are fetched again
@@ -26,13 +28,16 @@ const STABLECOINS: [&str; 4] = [
     "ij33n-oiaaa-aaaar-qbooa-cai",
 ];
 
-/// What the service keeps up to date, in memory, about the tokens OpenChat lists: which they are,
-/// their latest prices, and their hourly closes over the last week or so. Background tasks refresh
-/// it, so reading it never waits for a price API.
+/// What the service keeps up to date, in memory:
+/// - the tokens OpenChat lists, their latest prices, and their hourly closes over the last week or so
+/// - the largest coins whose symbols OpenChat doesn't list, eg. ADA, with their last week's prices
+///
+/// Background tasks refresh it, so reading it never waits for a price API.
 pub struct Market {
     listed: RwLock<Option<Arc<Listed>>>,
     latest: RwLock<Option<Arc<Latest>>>,
     hourly: RwLock<HashMap<CanisterId, Hourly>>,
+    coins: RwLock<Option<Arc<Coins>>>,
     in_flight: Mutex<HashSet<CanisterId>>,
     stablecoins: HashSet<CanisterId>,
     // Local ledgers standing in for mainnet ones, so a local OpenChat sees mainnet's prices
@@ -55,6 +60,27 @@ pub struct Latest {
     by_liquidity: Vec<CanisterId>,
 }
 
+/// The largest coins, from CoinGecko, leaving out those whose symbols OpenChat lists, so that a
+/// symbol means one token
+pub struct Coins {
+    /// When they were refreshed
+    pub timestamp: TimestampMillis,
+    /// By symbol, in upper case, each the largest coin with it
+    pub by_symbol: BTreeMap<String, Arc<Coin>>,
+    by_id: HashMap<String, Arc<Coin>>,
+}
+
+pub struct Coin {
+    /// CoinGecko's, eg. "cardano"
+    pub id: String,
+    /// In upper case, eg. "ADA"
+    pub symbol: String,
+    pub name: String,
+    pub usd: f64,
+    // Hourly, oldest first, ending with the latest price
+    history: Vec<PricePoint>,
+}
+
 #[derive(Default)]
 struct Hourly {
     // When they were fetched, and the closes, oldest first
@@ -65,7 +91,7 @@ struct Hourly {
 
 #[derive(Debug, PartialEq)]
 pub enum History {
-    UnknownLedger,
+    Unknown,
     NotLoaded,
     Stale,
     /// Oldest first, the first being the price at the start of the period, and the last the latest
@@ -79,6 +105,7 @@ impl Market {
             listed: RwLock::default(),
             latest: RwLock::default(),
             hourly: RwLock::default(),
+            coins: RwLock::default(),
             in_flight: Mutex::default(),
             stablecoins: STABLECOINS
                 .iter()
@@ -172,7 +199,7 @@ impl Market {
             return History::NotLoaded;
         };
         if !listed.ledgers.contains(&ledger) {
-            return History::UnknownLedger;
+            return History::Unknown;
         }
         let start = now.saturating_sub(period.millis());
         let latest = self.latest(now);
@@ -216,6 +243,70 @@ impl Market {
             });
         }
         History::Points(within_period(outliers::filter(points), period, now))
+    }
+
+    /// The largest coins, unless they're stale or haven't loaded yet
+    pub fn coins(&self, now: TimestampMillis) -> Option<Arc<Coins>> {
+        self.coins
+            .read()
+            .unwrap()
+            .clone()
+            .filter(|coins| now.saturating_sub(coins.timestamp) <= STALE_AFTER)
+    }
+
+    /// Keeps the largest coins, in order of market cap, leaving out those whose symbols OpenChat
+    /// lists. Does nothing until OpenChat's tokens have loaded.
+    pub fn set_coins(&self, markets: Vec<CoinMarket>, now: TimestampMillis) {
+        let Some(listed) = self.listed() else {
+            return;
+        };
+        let listed_symbols: HashSet<String> = listed
+            .tokens
+            .iter()
+            .map(|t| t.symbol.to_uppercase())
+            .collect();
+
+        let mut by_symbol = BTreeMap::new();
+        let mut by_id = HashMap::new();
+        for market in markets {
+            let symbol = market.symbol.to_uppercase();
+            if listed_symbols.contains(&symbol) || by_symbol.contains_key(&symbol) {
+                continue;
+            }
+            let coin = Arc::new(Coin {
+                history: coin_history(&market),
+                id: market.id,
+                symbol: symbol.clone(),
+                name: market.name,
+                usd: market.usd,
+            });
+            by_id.insert(coin.id.clone(), coin.clone());
+            by_symbol.insert(symbol, coin);
+        }
+
+        *self.coins.write().unwrap() = Some(Arc::new(Coins {
+            timestamp: now,
+            by_symbol,
+            by_id,
+        }));
+    }
+
+    /// The coin's prices over the period, ending with its latest price. Only goes back a week.
+    pub fn coin_history(&self, id: &str, period: Period, now: TimestampMillis) -> History {
+        let Some(coins) = self.coins.read().unwrap().clone() else {
+            return History::NotLoaded;
+        };
+        if now.saturating_sub(coins.timestamp) > STALE_AFTER {
+            return History::Stale;
+        }
+        match coins.by_id.get(id) {
+            Some(coin) => History::Points(within_period(
+                outliers::filter(coin.history.clone()),
+                period,
+                now,
+            )),
+            None => History::Unknown,
+        }
     }
 
     /// The token whose hourly closes are most due to be fetched, if any is: those never fetched
@@ -271,6 +362,25 @@ impl Market {
     }
 }
 
+// The sparkline's hourly prices, the last an hour before the latest price, then the latest price
+fn coin_history(market: &CoinMarket) -> Vec<PricePoint> {
+    let hours = market.sparkline.len() as u64;
+    market
+        .sparkline
+        .iter()
+        .enumerate()
+        .filter(|(_, price)| price.is_finite() && **price > 0.0)
+        .map(|(i, price)| PricePoint {
+            time: market.updated.saturating_sub((hours - i as u64) * HOUR),
+            price: *price,
+        })
+        .chain([PricePoint {
+            time: market.updated,
+            price: market.usd,
+        }])
+        .collect()
+}
+
 fn within_ratio(a: f64, b: f64, max_ratio: f64) -> bool {
     (1.0 / max_ratio..=max_ratio).contains(&(a / b))
 }
@@ -279,7 +389,6 @@ fn within_ratio(a: f64, b: f64, max_ratio: f64) -> bool {
 mod tests {
     use super::*;
 
-    const HOUR: u64 = 60 * MINUTE;
     const NOW: u64 = 1_792_926_499_000;
 
     fn ledger(text: &str) -> CanisterId {
@@ -464,7 +573,7 @@ mod tests {
         let market = market();
         assert_eq!(
             market.history(unlisted(), Period::Week, NOW),
-            History::UnknownLedger
+            History::Unknown
         );
         assert_eq!(
             market.history(chat(), Period::Week, NOW),
@@ -499,6 +608,96 @@ mod tests {
                 point(NOW, 1.0)
             ])
         );
+    }
+
+    fn coin_market(id: &str, symbol: &str, usd: f64, sparkline: Vec<f64>) -> CoinMarket {
+        CoinMarket {
+            id: id.to_string(),
+            symbol: symbol.to_string(),
+            name: id.to_string(),
+            usd,
+            updated: NOW - MINUTE,
+            sparkline,
+        }
+    }
+
+    #[test]
+    fn coins_are_the_largest_with_each_symbol_openchat_doesnt_list() {
+        let market = market();
+        market.set_coins(
+            vec![
+                coin_market("bitcoin", "btc", 80401.0, Vec::new()),
+                coin_market("cardano", "ada", 0.205, Vec::new()),
+                coin_market("internet-computer", "icp", 2.6, Vec::new()),
+                coin_market("ada-copy", "ada", 0.001, Vec::new()),
+            ],
+            NOW,
+        );
+
+        let coins = market.coins(NOW).unwrap();
+        assert_eq!(coins.timestamp, NOW);
+        let summary: Vec<(&str, &str, f64)> = coins
+            .by_symbol
+            .iter()
+            .map(|(symbol, coin)| (symbol.as_str(), coin.id.as_str(), coin.usd))
+            .collect();
+        assert_eq!(
+            summary,
+            [("ADA", "cardano", 0.205), ("BTC", "bitcoin", 80401.0)]
+        );
+        assert!(market.coins(NOW + HOUR + 1).is_none());
+    }
+
+    #[test]
+    fn a_coins_history_is_its_hourly_sparkline_then_its_latest_price() {
+        let market = market();
+        let updated = NOW - MINUTE;
+        market.set_coins(
+            vec![coin_market(
+                "cardano",
+                "ada",
+                0.205,
+                vec![0.21, f64::NAN, 0.206],
+            )],
+            NOW,
+        );
+
+        assert_eq!(
+            market.coin_history("cardano", Period::Week, NOW),
+            History::Points(vec![
+                point(updated - 3 * HOUR, 0.21),
+                point(updated - HOUR, 0.206),
+                point(updated, 0.205),
+            ])
+        );
+        assert_eq!(
+            market.coin_history("dogecoin", Period::Week, NOW),
+            History::Unknown
+        );
+        assert_eq!(
+            market.coin_history("cardano", Period::Week, NOW + HOUR + 1),
+            History::Stale
+        );
+        assert_eq!(
+            Market::new(HashMap::new()).coin_history("cardano", Period::Week, NOW),
+            History::NotLoaded
+        );
+    }
+
+    #[test]
+    fn a_coins_day_starts_at_its_price_a_day_ago() {
+        let market = market();
+        market.set_coins(
+            vec![coin_market("cardano", "ada", 0.205, vec![0.3; 30])],
+            NOW,
+        );
+
+        let History::Points(points) = market.coin_history("cardano", Period::Day, NOW) else {
+            panic!("No points");
+        };
+        assert_eq!(points.len(), 25);
+        assert_eq!(points[0], point(NOW - Period::Day.millis(), 0.3));
+        assert_eq!(points[24], point(NOW - MINUTE, 0.205));
     }
 
     #[test]

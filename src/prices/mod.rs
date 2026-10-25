@@ -1,6 +1,8 @@
 use anyhow::anyhow;
 use cache::Cache;
-use coingecko::CoinGecko;
+pub use coingecko::CoinGecko;
+#[cfg(test)]
+pub use coingecko::CoinMarket;
 use market::History;
 use oc_bots_sdk::types::{CanisterId, TimestampMillis};
 pub use registry::ListedToken;
@@ -75,30 +77,25 @@ impl From<anyhow::Error> for PriceError {
 /// far back as it goes, and otherwise from their source.
 pub struct Prices {
     market: Arc<Market>,
-    coingecko: CoinGecko,
+    coingecko: Arc<CoinGecko>,
     icpswap: Arc<IcpSwap>,
     found: Cache<String, Option<Token>>,
     histories: Cache<(Source, Period), Vec<PricePoint>>,
 }
 
 impl Prices {
-    pub fn new(
-        http: reqwest::Client,
-        coingecko_api_key: Option<String>,
-        market: Arc<Market>,
-        icpswap: Arc<IcpSwap>,
-    ) -> Self {
+    pub fn new(market: Arc<Market>, coingecko: Arc<CoinGecko>, icpswap: Arc<IcpSwap>) -> Self {
         Prices {
             market,
-            coingecko: CoinGecko::new(http, coingecko_api_key),
+            coingecko,
             icpswap,
             found: Cache::default(),
             histories: Cache::default(),
         }
     }
 
-    /// The token the symbol most likely means: one OpenChat lists, else the one with the largest
-    /// market cap on CoinGecko
+    /// The token the symbol most likely means: one OpenChat lists, else the coin with the largest
+    /// market cap on CoinGecko, which the market has if it's among the 250 largest
     pub async fn find(&self, symbol: &str) -> Result<Option<Token>, PriceError> {
         let key = symbol.to_lowercase();
         if let Some(token) = self.found.get(&key) {
@@ -109,9 +106,18 @@ impl Prices {
             .market
             .listed()
             .ok_or_else(|| anyhow!("OpenChat's tokens haven't loaded yet"))?;
-        let token = match find_listed(&listed.tokens, symbol) {
-            Some(token) => Some(token),
-            None => self.coingecko.find(symbol).await?.map(|coin| Token {
+        let largest_coin = self
+            .market
+            .coins(now())
+            .and_then(|coins| coins.by_symbol.get(&symbol.to_uppercase()).cloned());
+        let token = match (find_listed(&listed.tokens, symbol), largest_coin) {
+            (Some(token), _) => Some(token),
+            (None, Some(coin)) => Some(Token {
+                symbol: coin.symbol.clone(),
+                name: coin.name.clone(),
+                source: Source::CoinGecko(coin.id.clone()),
+            }),
+            (None, None) => self.coingecko.find(symbol).await?.map(|coin| Token {
                 symbol: coin.symbol.to_uppercase(),
                 name: coin.name,
                 source: Source::CoinGecko(coin.id),
@@ -128,10 +134,17 @@ impl Prices {
         token: &Token,
         period: Period,
     ) -> Result<Vec<PricePoint>, PriceError> {
-        if let Source::Icp(ledger) = token.source
-            && (period.days() <= 7 || self.market.is_pinned(ledger))
-            && let History::Points(points) = self.market.history(ledger, period, now())
-        {
+        // The market goes back a week
+        let from_market = match &token.source {
+            Source::Icp(ledger) if period.days() <= 7 || self.market.is_pinned(*ledger) => {
+                self.market.history(*ledger, period, now())
+            }
+            Source::CoinGecko(id) if period.days() <= 7 => {
+                self.market.coin_history(id, period, now())
+            }
+            _ => History::NotLoaded,
+        };
+        if let History::Points(points) = from_market {
             return Ok(points);
         }
 
@@ -264,7 +277,11 @@ mod tests {
         }]);
         market.set_hourly(chat, Some(vec![point(now() - 60 * 60 * 1000, 0.03)]), now());
         let http = http_client().unwrap();
-        let prices = Prices::new(http.clone(), None, market, Arc::new(IcpSwap::new(http)));
+        let prices = Prices::new(
+            market,
+            Arc::new(CoinGecko::new(http.clone(), None)),
+            Arc::new(IcpSwap::new(http)),
+        );
 
         // Neither calls a price API
         let token = prices.find("chat").await.unwrap().unwrap();

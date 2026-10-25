@@ -1,3 +1,4 @@
+use super::coingecko::CoinGecko;
 use super::icpswap::IcpSwap;
 use super::market::Market;
 use super::{now, registry};
@@ -8,6 +9,8 @@ use tracing::{info, warn};
 
 const LISTED_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const LATEST_INTERVAL: Duration = Duration::from_secs(60);
+// About 7,200 calls a month, inside a CoinGecko Demo key's 10,000, with room for ChartBot's
+const COINS_INTERVAL: Duration = Duration::from_secs(6 * 60);
 const RETRY_DELAY: Duration = Duration::from_secs(60);
 const IDLE_DELAY: Duration = Duration::from_secs(10);
 // A week has 168 hours, and these reach back before it, for the price at its start, through hours
@@ -18,10 +21,17 @@ const HOURLY_LIMIT: u32 = 200;
 const HOURLY_WORKERS: usize = 2;
 
 /// Keeps the market up to date, in the background, for as long as the process runs: OpenChat's
-/// tokens hourly, their latest prices every minute, and each token's hourly closes every 15 minutes
-pub fn spawn(market: Arc<Market>, icpswap: Arc<IcpSwap>, mainnet: Agent) {
+/// tokens hourly, their latest prices every minute, each token's hourly closes every 15 minutes, and
+/// the largest coins every 6 minutes
+pub fn spawn(
+    market: Arc<Market>,
+    icpswap: Arc<IcpSwap>,
+    coingecko: Arc<CoinGecko>,
+    mainnet: Agent,
+) {
     tokio::spawn(refresh_listed(market.clone(), mainnet));
     tokio::spawn(refresh_latest(market.clone(), icpswap.clone()));
+    tokio::spawn(refresh_coins(market.clone(), coingecko));
     for _ in 0..HOURLY_WORKERS {
         tokio::spawn(refresh_hourly(market.clone(), icpswap.clone()));
     }
@@ -60,6 +70,27 @@ async fn refresh_latest(market: Arc<Market>, icpswap: Arc<IcpSwap>) {
             Err(error) => warn!(?error, "Failed to get the latest prices"),
         }
         tokio::time::sleep(LATEST_INTERVAL).await;
+    }
+}
+
+async fn refresh_coins(market: Arc<Market>, coingecko: Arc<CoinGecko>) {
+    loop {
+        // Coins whose symbols OpenChat lists are left out
+        if market.listed().is_none() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+        let delay = match coingecko.top_coins().await {
+            Ok(coins) => {
+                market.set_coins(coins, now());
+                COINS_INTERVAL
+            }
+            Err(error) => {
+                warn!(?error, "Failed to get the largest coins");
+                RETRY_DELAY
+            }
+        };
+        tokio::time::sleep(delay).await;
     }
 }
 

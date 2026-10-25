@@ -3,7 +3,7 @@
 
 use crate::chart_bot::Chart;
 use crate::config::Config;
-use crate::prices::{IcpSwap, Market, Prices};
+use crate::prices::{CoinGecko, IcpSwap, Market, Prices};
 use anyhow::{Result, anyhow, bail};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -56,15 +56,11 @@ async fn main() -> Result<()> {
     let mainnet = Agent::builder().with_url(mainnet_ic_url()).build()?;
     let http = prices::http_client()?;
     let icpswap = Arc::new(IcpSwap::new(http.clone()));
+    let coingecko = Arc::new(CoinGecko::new(http, config.coingecko_api_key));
     let market = Arc::new(Market::new(config.ledger_aliases));
-    prices::spawn_refresh(market.clone(), icpswap.clone(), mainnet);
+    prices::spawn_refresh(market.clone(), icpswap.clone(), coingecko.clone(), mainnet);
 
-    let prices = Arc::new(Prices::new(
-        http,
-        config.coingecko_api_key,
-        market.clone(),
-        icpswap,
-    ));
+    let prices = Arc::new(Prices::new(market.clone(), coingecko, icpswap));
     let commands = CommandHandlerRegistry::new(oc_client_factory)
         .register(Chart::new(prices, config.storage_index));
 
@@ -176,7 +172,7 @@ fn identity_from_pem(pem: &str) -> Result<Box<dyn Identity>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prices::{ListedToken, PricePoint, TokenPrice, now};
+    use crate::prices::{CoinMarket, ListedToken, PricePoint, TokenPrice, now};
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, Response, header};
     use ic_agent::export::Principal;
@@ -339,6 +335,62 @@ mod tests {
                 "{uri}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_largest_other_coins_are_priced_by_symbol_once_theyve_loaded() {
+        let market = market();
+        let body = json(get(market.clone(), "/v1/prices").await).await;
+        assert!(body.get("coins").is_none());
+
+        market.set_coins(
+            vec![CoinMarket {
+                id: "cardano".to_string(),
+                symbol: "ada".to_string(),
+                name: "Cardano".to_string(),
+                usd: 0.204964,
+                updated: now(),
+                sparkline: vec![0.21, 0.206],
+            }],
+            now(),
+        );
+        let body = json(get(market.clone(), "/v1/prices").await).await;
+        assert_eq!(
+            body["coins"],
+            serde_json::json!({ "ADA": { "id": "cardano", "name": "Cardano", "usd": 0.204964 } })
+        );
+
+        let response = get(market.clone(), "/v1/coins/cardano/history?range=7d").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header(&response, header::CACHE_CONTROL),
+            "public, max-age=300"
+        );
+        let body = json(response).await;
+        assert_eq!(body["id"], "cardano");
+        assert!(body.get("ledger").is_none());
+        assert_eq!(body["interval"], "1h");
+        let prices: Vec<f64> = body["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p[1].as_f64().unwrap())
+            .collect();
+        assert_eq!(prices, [0.21, 0.206, 0.204964]);
+
+        let response = get(market, "/v1/coins/dogecoin/history?range=7d").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            json(response).await,
+            serde_json::json!({ "error": "Unknown coin" })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_coins_history_before_the_coins_load_is_a_503() {
+        let response = get(market(), "/v1/coins/cardano/history?range=7d").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(header(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN), "*");
     }
 
     #[tokio::test]

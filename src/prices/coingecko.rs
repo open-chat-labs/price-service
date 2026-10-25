@@ -1,20 +1,19 @@
 use super::Period;
 use super::{PriceError, PricePoint};
-use crate::prices::cache::{Cache, RateLimiter};
+use crate::prices::cache::RateLimiter;
 use anyhow::anyhow;
+use chrono::DateTime;
+use oc_bots_sdk::types::TimestampMillis;
 use reqwest::StatusCode;
 use serde::Deserialize;
-use std::time::Duration;
 
 const BASE_URL: &str = "https://api.coingecko.com/api/v3";
-const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// CoinGecko's free API, for tokens which aren't on the Internet Computer
 pub struct CoinGecko {
     http: reqwest::Client,
     api_key: Option<String>,
     rate_limiter: RateLimiter,
-    top_coins: Cache<(), Vec<Coin>>,
 }
 
 /// A coin, as CoinGecko's markets list it
@@ -23,6 +22,36 @@ pub struct Coin {
     pub id: String,
     pub symbol: String,
     pub name: String,
+}
+
+/// One of the largest coins, with its latest price and its prices over the last week
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoinMarket {
+    pub id: String,
+    /// As CoinGecko writes it, in lower case, eg. "ada"
+    pub symbol: String,
+    pub name: String,
+    pub usd: f64,
+    /// When CoinGecko last updated its price
+    pub updated: TimestampMillis,
+    /// Hourly, oldest first, the last being an hour before `updated`, and NaN where CoinGecko has
+    /// none
+    pub sparkline: Vec<f64>,
+}
+
+#[derive(Deserialize)]
+struct Market {
+    id: String,
+    symbol: String,
+    name: String,
+    current_price: Option<f64>,
+    last_updated: Option<String>,
+    sparkline_in_7d: Option<Sparkline>,
+}
+
+#[derive(Deserialize)]
+struct Sparkline {
+    price: Vec<Option<f64>>,
 }
 
 #[derive(Deserialize)]
@@ -40,16 +69,12 @@ impl CoinGecko {
             http,
             api_key,
             rate_limiter: RateLimiter::per_minute(limit),
-            top_coins: Cache::default(),
         }
     }
 
-    /// The coin with the largest market cap which has the symbol
+    /// The coin with the largest market cap which has the symbol. The market keeps the largest
+    /// coins, so this is only needed for the others.
     pub async fn find(&self, symbol: &str) -> Result<Option<Coin>, PriceError> {
-        // Most symbols asked for are among the largest coins, which saves a call for each
-        if let Some(coin) = find(&self.top_coins().await?, symbol) {
-            return Ok(Some(coin));
-        }
         let coins: Vec<Coin> = self
             .get(
                 "/coins/markets",
@@ -63,23 +88,21 @@ impl CoinGecko {
         Ok(find(&coins, symbol))
     }
 
-    // The 250 coins with the largest market caps, largest first
-    async fn top_coins(&self) -> Result<Vec<Coin>, PriceError> {
-        if let Some(coins) = self.top_coins.get(&()) {
-            return Ok(coins);
-        }
-        let coins: Vec<Coin> = self
+    /// The 250 coins with the largest market caps, largest first, with their prices over the last
+    /// week, in a single call
+    pub async fn top_coins(&self) -> Result<Vec<CoinMarket>, PriceError> {
+        let markets: Vec<Market> = self
             .get(
                 "/coins/markets",
                 &[
                     ("vs_currency", "usd"),
                     ("order", "market_cap_desc"),
                     ("per_page", "250"),
+                    ("sparkline", "true"),
                 ],
             )
             .await?;
-        self.top_coins.insert((), coins.clone(), DAY);
-        Ok(coins)
+        Ok(coin_markets(markets))
     }
 
     pub async fn history(&self, id: &str, period: Period) -> Result<Vec<PricePoint>, PriceError> {
@@ -121,6 +144,31 @@ fn find(coins: &[Coin], symbol: &str) -> Option<Coin> {
         .iter()
         .find(|c| c.symbol.eq_ignore_ascii_case(symbol))
         .cloned()
+}
+
+// Those with a price, and when it was updated
+fn coin_markets(markets: Vec<Market>) -> Vec<CoinMarket> {
+    markets
+        .into_iter()
+        .filter_map(|market| {
+            let usd = market.current_price.filter(|p| p.is_finite() && *p > 0.0)?;
+            let updated = DateTime::parse_from_rfc3339(&market.last_updated?).ok()?;
+            Some(CoinMarket {
+                id: market.id,
+                symbol: market.symbol,
+                name: market.name,
+                usd,
+                updated: updated.timestamp_millis() as TimestampMillis,
+                sparkline: market
+                    .sparkline_in_7d
+                    .map(|s| s.price)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| p.filter(|p| p.is_finite() && *p > 0.0).unwrap_or(f64::NAN))
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 // CoinGecko gives a point every 5 minutes over a day, every hour up to 90 days, and every day beyond,
@@ -199,6 +247,40 @@ mod tests {
         ];
         assert_eq!(find(&coins, "BTC"), Some(coin("bitcoin", "btc")));
         assert_eq!(find(&coins, "eth"), None);
+    }
+
+    #[test]
+    fn top_coins_have_their_price_update_time_and_sparkline() {
+        // Trimmed from /coins/markets?sparkline=true
+        let markets: Vec<Market> = serde_json::from_str(
+            r#"[
+                {"id": "cardano", "symbol": "ada", "name": "Cardano", "current_price": 0.204964, "market_cap_rank": 10, "last_updated": "2026-10-25T21:08:58.000Z", "sparkline_in_7d": {"price": [0.21306, null, 0.20584]}},
+                {"id": "dead", "symbol": "dead", "name": "Dead", "current_price": null, "last_updated": "2026-10-25T21:08:58.000Z", "sparkline_in_7d": {"price": []}},
+                {"id": "new", "symbol": "new", "name": "New", "current_price": 1.5, "last_updated": "2026-10-25T21:08:58.000Z"}
+            ]"#,
+        )
+        .unwrap();
+        let coins = coin_markets(markets);
+
+        assert_eq!(coins.len(), 2);
+        assert_eq!(coins[0].id, "cardano");
+        assert_eq!(coins[0].symbol, "ada");
+        assert_eq!(coins[0].usd, 0.204964);
+        assert_eq!(coins[0].updated, 1792962538000);
+        assert_eq!(coins[0].sparkline[0], 0.21306);
+        assert!(coins[0].sparkline[1].is_nan());
+        assert_eq!(coins[0].sparkline[2], 0.20584);
+        assert!(coins[1].sparkline.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "calls CoinGecko"]
+    async fn gets_the_top_coins() {
+        let coingecko = CoinGecko::new(crate::prices::http_client().unwrap(), None);
+        let coins = coingecko.top_coins().await.unwrap();
+        assert!(coins.len() > 200, "{} coins", coins.len());
+        let ada = coins.iter().find(|c| c.id == "cardano").unwrap();
+        assert!(ada.sparkline.len() > 100);
     }
 
     #[test]
