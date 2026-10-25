@@ -172,3 +172,194 @@ fn identity_from_pem(pem: &str) -> Result<Box<dyn Identity>> {
         bail!("The bot's PEM is neither a secp256k1 nor an Ed25519 key")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prices::{ListedToken, PricePoint, TokenPrice, now};
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, Response, header};
+    use ic_agent::export::Principal;
+    use std::collections::HashMap;
+    use tower::ServiceExt;
+
+    const CHAT: &str = "2ouva-viaaa-aaaaq-aaamq-cai";
+    const ICP: &str = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+    const UNLISTED: &str = "73mez-iiaaa-aaaaq-aaasq-cai";
+
+    fn ledger(text: &str) -> oc_bots_sdk::types::CanisterId {
+        Principal::from_text(text).unwrap().into()
+    }
+
+    // CHAT is listed and priced, with an hour's close, and ICP is listed but has no closes yet
+    fn market() -> Arc<Market> {
+        let market = Arc::new(Market::new(HashMap::new()));
+        market.set_listed(
+            [(CHAT, "CHAT"), (ICP, "ICP")]
+                .into_iter()
+                .map(|(text, symbol)| ListedToken {
+                    ledger: ledger(text),
+                    symbol: symbol.to_string(),
+                    name: symbol.to_string(),
+                    enabled: true,
+                })
+                .collect(),
+        );
+        market.set_hourly(
+            ledger(CHAT),
+            Some(vec![PricePoint {
+                time: now() - 60 * 60 * 1000,
+                price: 0.029,
+            }]),
+            now(),
+        );
+        market.set_latest(
+            vec![TokenPrice {
+                ledger: ledger(CHAT),
+                usd: 0.0281335,
+                tvl_usd: 60_000.0,
+            }],
+            now(),
+        );
+        market
+    }
+
+    async fn get(market: Arc<Market>, uri: &str) -> Response<Body> {
+        with_layers(api::router(market))
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn json(response: Response<Body>) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn header(response: &Response<Body>, name: header::HeaderName) -> &str {
+        response.headers()[name].to_str().unwrap()
+    }
+
+    #[tokio::test]
+    async fn prices_are_keyed_by_ledger_and_cached_for_a_minute() {
+        let response = get(market(), "/v1/prices").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header(&response, header::CONTENT_TYPE), "application/json");
+        assert_eq!(
+            header(&response, header::CACHE_CONTROL),
+            "public, max-age=60"
+        );
+        assert_eq!(header(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN), "*");
+        let body = json(response).await;
+        assert!(body["timestamp"].as_u64().unwrap() > 1_700_000_000_000);
+        assert_eq!(
+            body["prices"],
+            serde_json::json!({ CHAT: { "usd": 0.0281335 } })
+        );
+    }
+
+    #[tokio::test]
+    async fn prices_which_havent_loaded_are_a_503() {
+        let response = get(Arc::new(Market::new(HashMap::new())), "/v1/prices").await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(header(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN), "*");
+        assert_eq!(header(&response, header::CACHE_CONTROL), "no-store");
+        assert_eq!(
+            json(response).await,
+            serde_json::json!({ "error": "Prices are stale" })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_history_is_points_oldest_first_cached_for_5_minutes() {
+        let response = get(market(), &format!("/v1/prices/{CHAT}/history?range=7d")).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header(&response, header::CACHE_CONTROL),
+            "public, max-age=300"
+        );
+        let body = json(response).await;
+        assert_eq!(body["ledger"], CHAT);
+        assert_eq!(body["range"], "7d");
+        assert_eq!(body["interval"], "1h");
+        let points = body["points"].as_array().unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0][1], 0.029);
+        assert_eq!(points[1][1], 0.0281335);
+        assert!(points[0][0].as_u64() < points[1][0].as_u64());
+    }
+
+    #[tokio::test]
+    async fn history_errors() {
+        for (uri, status, error) in [
+            (
+                format!("/v1/prices/{CHAT}/history?range=30d"),
+                StatusCode::BAD_REQUEST,
+                "Unsupported range: use 1d or 7d",
+            ),
+            (
+                format!("/v1/prices/{CHAT}/history"),
+                StatusCode::BAD_REQUEST,
+                "Unsupported range: use 1d or 7d",
+            ),
+            (
+                format!("/v1/prices/{UNLISTED}/history?range=7d"),
+                StatusCode::NOT_FOUND,
+                "Unknown ledger",
+            ),
+            (
+                "/v1/prices/not-a-ledger/history?range=7d".to_string(),
+                StatusCode::NOT_FOUND,
+                "Unknown ledger",
+            ),
+            (
+                format!("/v1/prices/{ICP}/history?range=7d"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The token's prices haven't loaded yet",
+            ),
+            (
+                "/v1/nothing".to_string(),
+                StatusCode::NOT_FOUND,
+                "Not found",
+            ),
+        ] {
+            let response = get(market(), &uri).await;
+            assert_eq!(response.status(), status, "{uri}");
+            assert_eq!(
+                header(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                "*",
+                "{uri}"
+            );
+            assert_eq!(
+                json(response).await,
+                serde_json::json!({ "error": error }),
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_are_compressed_and_allow_any_origin() {
+        let response = with_layers(api::router(market()))
+            .oneshot(
+                Request::get("/v1/prices")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .header(header::ORIGIN, "https://oc.app")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(header(&response, header::CONTENT_ENCODING), "gzip");
+        let origins: Vec<_> = response
+            .headers()
+            .get_all(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .iter()
+            .collect();
+        assert_eq!(origins, ["*"]);
+    }
+}

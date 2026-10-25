@@ -3,7 +3,7 @@ use cache::Cache;
 use coingecko::CoinGecko;
 use market::History;
 use oc_bots_sdk::types::{CanisterId, TimestampMillis};
-use registry::ListedToken;
+pub use registry::ListedToken;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +17,8 @@ mod refresh;
 mod registry;
 
 pub use icpswap::IcpSwap;
+#[cfg(test)]
+pub use icpswap::TokenPrice;
 pub use market::{History as MarketHistory, Market};
 pub use period::Period;
 pub use refresh::spawn as spawn_refresh;
