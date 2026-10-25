@@ -250,6 +250,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn listed_tokens_are_found_and_charted_for_up_to_a_week_from_the_market() {
+        let chat: CanisterId = Principal::from_text("2ouva-viaaa-aaaaq-aaamq-cai")
+            .unwrap()
+            .into();
+        let market = Arc::new(Market::new(std::collections::HashMap::new()));
+        market.set_listed(vec![ListedToken {
+            ledger: chat,
+            symbol: "CHAT".to_string(),
+            name: "OpenChat".to_string(),
+            enabled: true,
+        }]);
+        market.set_hourly(chat, Some(vec![point(now() - 60 * 60 * 1000, 0.03)]), now());
+        let http = http_client().unwrap();
+        let prices = Prices::new(http.clone(), None, market, Arc::new(IcpSwap::new(http)));
+
+        // Neither calls a price API
+        let token = prices.find("chat").await.unwrap().unwrap();
+        assert_eq!(token.source, Source::Icp(chat));
+        let points = prices.history(&token, Period::Week).await.unwrap();
+        assert_eq!(points.iter().map(|p| p.price).collect::<Vec<_>>(), [0.03]);
+    }
+
     fn point(time: TimestampMillis, price: f64) -> PricePoint {
         PricePoint { time, price }
     }
