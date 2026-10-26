@@ -14,7 +14,9 @@ docker pull "$image"
 install -d -m 0700 -o nobody -g nobody "$dir"
 umask 077
 : > "$dir/env"
-for name in $(aws ssm get-parameters-by-path --path /oc-price-service/ --query 'Parameters[].Name' --output text); do
+# Without a trailing slash, as the instance's role is allowed to list the path as written here
+names=$(aws ssm get-parameters-by-path --path /oc-price-service --query 'Parameters[].Name' --output text)
+for name in $names; do
     value=$(aws ssm get-parameter --name "$name" --with-decryption --query Parameter.Value --output text)
     case "${name##*/}" in
         OC_IDENTITY_PEM) printf '%s\n' "$value" > "$dir/identity.pem" ;;
