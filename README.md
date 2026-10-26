@@ -228,6 +228,13 @@ managed through SSM.
    - `/oc-price-service/PUBLIC_URL`: a String, the CloudFront distribution's url, which the deploy
      checks.
    - Any other variable under [Configuration](#configuration) can be added the same way.
+
+   [`scripts/set_aws_params.sh`](./scripts/set_aws_params.sh) sets the three. It takes the identity
+   from dfx and asks for the key. Pass it the url once the distribution exists:
+
+   ```bash
+   ./scripts/set_aws_params.sh https://<distribution>.cloudfront.net
+   ```
 3. **A CloudWatch log group,** `/oc/price-service`.
 4. **The instance's role** also needs:
    - `ssm:GetParametersByPath` on `parameter/oc-price-service`, and `ssm:GetParameter` on
