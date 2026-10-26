@@ -191,6 +191,8 @@ It's a long-running server, so the prices it caches are shared between requests.
 
 3. **Register the bot on OpenChat:** run `/register_bot` in OpenChat, with the service's public url
    as its endpoint and the identity's principal. OpenChat reads its definition from the endpoint.
+   Give it the avatar [`docs/avatar.png`](./docs/avatar.png), drawn from
+   [`docs/avatar.svg`](./docs/avatar.svg) in the charts' colours.
 
 4. **Install it** in a group, community or direct chat, granting it the permission to send text
    and image messages.
