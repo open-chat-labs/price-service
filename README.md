@@ -283,7 +283,11 @@ managed through SSM.
      North America's and Europe's.
 8. **The deploy role,** `GitHubActions-DeployPriceService`, which GitHub can assume only from `main`:
    - **Trust:** the OIDC provider `token.actions.githubusercontent.com`, with `aud`
-     `sts.amazonaws.com` and `sub` `repo:open-chat-labs/price-service:ref:refs/heads/main`.
+     `sts.amazonaws.com` and `sub`
+     `repo:open-chat-labs@89913586/price-service@1433257699:ref:refs/heads/main`.
+     - The repository uses GitHub's immutable subjects, which name the organisation and the
+       repository with their ids, unlike open-chat-bots'. So a repository given the same name later
+       couldn't deploy.
    - **Permissions:**
      - pushing to the `oc-price-service` ECR repository, plus `ecr:GetAuthorizationToken`;
      - `ssm:SendCommand` on the instance with the `AWS-RunShellScript` document, and
