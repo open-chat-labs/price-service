@@ -4,6 +4,7 @@ use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use plotters::coord::Shift;
+use plotters::coord::types::RangedCoordf64;
 use plotters::prelude::*;
 use plotters::style::{FontStyle, register_font};
 use resvg::{tiny_skia, usvg};
@@ -19,6 +20,9 @@ const FOOTER_HEIGHT: u32 = 56;
 // When the legend wraps, each row after the first adds this to the header, and to the height
 const LEGEND_ROW_HEIGHT: u32 = 44;
 const LEGEND_LABEL_SIZE: u32 = 28;
+// A single token's high and low are labelled with their prices, this far from the line
+const EXTREME_LABEL_SIZE: u32 = 24;
+const EXTREME_LABEL_GAP: i32 = 14;
 
 const FONT: &str = "sans-serif";
 
@@ -261,9 +265,11 @@ fn draw_plot(area: &DrawingArea<SVGBackend, Shift>, lines: &[Line], as_change: b
         min = min.min(0.0);
         max = max.max(0.0);
     }
-    // At least a sliver either side, so a flat line isn't drawn along an edge
+    // At least a sliver either side, so a flat line isn't drawn along an edge. A single token's has
+    // room for the labels on its high and low.
     let min_margin = if as_change { 0.5 } else { max.abs() * 0.001 };
-    let margin = ((max - min) * 0.08).max(min_margin).max(f64::MIN_POSITIVE);
+    let share = if as_change { 0.08 } else { 0.14 };
+    let margin = ((max - min) * share).max(min_margin).max(f64::MIN_POSITIVE);
     let (y_min, y_max) = (min - margin, max + margin);
     let y_min = if as_change { y_min } else { y_min.max(0.0) };
     let step = tick_step(y_max - y_min);
@@ -311,6 +317,13 @@ fn draw_plot(area: &DrawingArea<SVGBackend, Shift>, lines: &[Line], as_change: b
         ))
         .map_err(error)?;
 
+    let marked = if as_change {
+        Vec::new()
+    } else {
+        mark_extremes(&chart, &series[0])
+    };
+    draw_extreme_labels(&chart, &marked)?;
+
     // The first token is drawn last, so it's on top
     for (points, color) in series.iter().zip(SERIES).rev() {
         chart
@@ -329,7 +342,115 @@ fn draw_plot(area: &DrawingArea<SVGBackend, Shift>, lines: &[Line], as_change: b
             ])
             .map_err(error)?;
     }
+
+    draw_extreme_dots(&chart, &marked, SERIES[0])?;
     Ok(())
+}
+
+type Chart<'a, 'b> =
+    ChartContext<'a, SVGBackend<'b>, Cartesian2d<RangedDateTime<DateTime<Utc>>, RangedCoordf64>>;
+
+// A single token's high or low, and where its label goes, relative to it
+struct Marked {
+    point: (DateTime<Utc>, f64),
+    label: String,
+    // The label's top left, and its width
+    offset: (i32, i32),
+    width: i32,
+}
+
+// Labels a single token's high and low with their prices, above the high and below the low, inside
+// the plot
+fn mark_extremes(chart: &Chart, points: &[(DateTime<Utc>, f64)]) -> Vec<Marked> {
+    let values: Vec<f64> = points.iter().map(|p| p.1).collect();
+    let (x_range, y_range) = chart.plotting_area().get_pixel_range();
+    let height = EXTREME_LABEL_SIZE as i32;
+
+    extremes(&values)
+        .into_iter()
+        .map(|(index, extreme)| {
+            let point = points[index];
+            let label = format::usd(point.1);
+            let width = text_width(&label, EXTREME_LABEL_SIZE, FontStyle::Normal);
+            let (x, y) = chart.backend_coord(&point);
+
+            // Centred on the point, unless that would run out of the plot
+            let left =
+                (x - width / 2).clamp(x_range.start, (x_range.end - width).max(x_range.start));
+            // On the far side of the point from the line, unless there's no room
+            let above = y - EXTREME_LABEL_GAP - height;
+            let below = y + EXTREME_LABEL_GAP;
+            let top = match extreme {
+                Extreme::High if above >= y_range.start => above,
+                Extreme::Low if below + height <= y_range.end => below,
+                Extreme::High => below,
+                Extreme::Low => above,
+            };
+            Marked {
+                point,
+                label,
+                offset: (left - x, top - y),
+                width,
+            }
+        })
+        .collect()
+}
+
+// The labels go under the line, each on a patch of the surface which hides the gridlines behind it
+fn draw_extreme_labels(chart: &Chart, marked: &[Marked]) -> Result<()> {
+    let style = font(EXTREME_LABEL_SIZE, FontStyle::Normal).color(&SECONDARY_INK);
+    for m in marked {
+        let (dx, dy) = m.offset;
+        let patch = [
+            (dx - 6, dy - 2),
+            (dx + m.width + 6, dy + EXTREME_LABEL_SIZE as i32 + 2),
+        ];
+        chart
+            .plotting_area()
+            .draw(
+                &(EmptyElement::at(m.point)
+                    + Rectangle::new(patch, SURFACE.filled())
+                    + Text::new(m.label.clone(), m.offset, style.clone())),
+            )
+            .map_err(error)?;
+    }
+    Ok(())
+}
+
+// Dots on the line, without the latest price's ring, which would cut a sharp peak off from its dot
+fn draw_extreme_dots(chart: &Chart, marked: &[Marked], color: RGBColor) -> Result<()> {
+    for m in marked {
+        chart
+            .plotting_area()
+            .draw(&Circle::new(m.point, 7, color.filled()))
+            .map_err(error)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Extreme {
+    High,
+    Low,
+}
+
+// Which points to label as the high and low. The latest price has its own dot, so a high or low
+// which is also the latest isn't labelled, and a flat line has neither.
+fn extremes(values: &[f64]) -> Vec<(usize, Extreme)> {
+    let (Some(high), Some(low), Some(latest)) = (
+        (0..values.len()).max_by(|&a, &b| values[a].total_cmp(&values[b])),
+        (0..values.len()).min_by(|&a, &b| values[a].total_cmp(&values[b])),
+        values.last(),
+    ) else {
+        return Vec::new();
+    };
+    if values[high] == values[low] {
+        return Vec::new();
+    }
+    [(high, Extreme::High), (low, Extreme::Low)]
+        .into_iter()
+        .filter(|(index, _)| values[*index] != *latest)
+        .collect()
 }
 
 // The sources are credited in the message's caption, where they can be linked
@@ -490,6 +611,41 @@ mod tests {
         // Its legend takes two rows, which makes it taller
         assert_is_png(&png, HEIGHT + LEGEND_ROW_HEIGHT);
         save("several", &png);
+    }
+
+    #[test]
+    fn the_high_and_low_are_labelled_unless_theyre_the_latest() {
+        // A dip, then a peak, then a little lower
+        assert_eq!(
+            extremes(&[2.0, 1.0, 3.0, 2.5]),
+            [(2, Extreme::High), (1, Extreme::Low)]
+        );
+        // Rising, so the high is the latest
+        assert_eq!(extremes(&[1.0, 2.0, 3.0]), [(0, Extreme::Low)]);
+        // Falling, so the low is the latest
+        assert_eq!(extremes(&[3.0, 2.0, 1.0]), [(0, Extreme::High)]);
+        // Back at its high
+        assert_eq!(extremes(&[3.0, 1.0, 3.0]), [(1, Extreme::Low)]);
+        assert!(extremes(&[1.0, 1.0, 1.0]).is_empty());
+    }
+
+    #[test]
+    fn renders_a_high_and_low_at_the_plots_edges() {
+        // The high is the first point, and the low the second, so their labels are kept inside
+        let mut prices = vec![0.9, 0.2];
+        prices.extend(wave(46, 0.5, 0.02).into_iter().skip(1));
+        let prices = points(&prices, 3_600_000);
+        let png = render(
+            &[Line {
+                symbol: "CHAT",
+                name: "OpenChat",
+                points: &prices,
+            }],
+            Period::Day,
+        )
+        .unwrap();
+        assert_is_png(&png, HEIGHT);
+        save("edges", &png);
     }
 
     #[test]

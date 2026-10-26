@@ -96,8 +96,9 @@ The period is optional and goes anywhere: `1d`, `7d` (the default), `30d`, `90d`
 case, and a leading `$` is ignored.
 
 The chart is posted as an image, which gives each token's price at the start of the period and
-now, and its change. Its caption credits where the prices came from. If a token can't be found, or
-there aren't enough prices for it, only whoever ran the command is told.
+now, and its change. A single token's chart also marks its high and low with their prices, unless
+one is the latest price, which has its own dot. Its caption credits where the prices came from. If
+a token can't be found, or there aren't enough prices for it, only whoever ran the command is told.
 
 ![/chart CHAT ICP ckBTC 30d](./docs/example.png)
 
