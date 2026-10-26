@@ -49,7 +49,7 @@ pub struct Line<'a> {
 
 /// Draws the lines as a PNG. One line is drawn as its price in USD. Several are drawn as their
 /// change since the start of the period, so they share an axis.
-pub fn render(lines: &[Line], period: Period) -> Result<Vec<u8>> {
+pub fn render(lines: &[Line], period: Period, sources: &[&str]) -> Result<Vec<u8>> {
     if lines.is_empty() || lines.len() > SERIES.len() || lines.iter().any(|l| l.points.len() < 2) {
         return Err(anyhow!("Can't chart {} lines", lines.len()));
     }
@@ -73,7 +73,7 @@ pub fn render(lines: &[Line], period: Period) -> Result<Vec<u8>> {
             draw_title(&header, &lines[0], period)?;
         }
         draw_plot(&plot, lines, as_change)?;
-        draw_footer(&footer)?;
+        draw_footer(&footer, sources)?;
         root.present().map_err(error)?;
     }
 
@@ -332,12 +332,15 @@ fn draw_plot(area: &DrawingArea<SVGBackend, Shift>, lines: &[Line], as_change: b
     Ok(())
 }
 
-// The sources are credited in the message's caption, where they can be linked
-fn draw_footer(area: &DrawingArea<SVGBackend, Shift>) -> Result<()> {
-    let text = "Times in UTC";
+fn draw_footer(area: &DrawingArea<SVGBackend, Shift>, sources: &[&str]) -> Result<()> {
+    let text = if sources.is_empty() {
+        "Times in UTC".to_string()
+    } else {
+        format!("Times in UTC · Price data by {}", sources.join(" and "))
+    };
     let style = font(24, FontStyle::Normal).color(&MUTED_INK);
-    let width = text_width(text, 24, FontStyle::Normal);
-    area.draw_text(text, &style, (WIDTH as i32 - PADDING - width, 8))
+    let width = text_width(&text, 24, FontStyle::Normal);
+    area.draw_text(&text, &style, (WIDTH as i32 - PADDING - width, 8))
         .map_err(error)
 }
 
@@ -455,6 +458,7 @@ mod tests {
                 points: &prices,
             }],
             Period::Week,
+            &["ICPSwap"],
         )
         .unwrap();
         assert_is_png(&png, HEIGHT);
@@ -485,6 +489,7 @@ mod tests {
                 },
             ],
             Period::Quarter,
+            &["ICPSwap", "CoinGecko"],
         )
         .unwrap();
         // Its legend takes two rows, which makes it taller
@@ -502,6 +507,7 @@ mod tests {
                 points: &prices,
             }],
             Period::Day,
+            &[],
         )
         .unwrap();
         assert_is_png(&png, HEIGHT);
@@ -532,7 +538,7 @@ mod tests {
             );
         }
 
-        let png = render(&lines, Period::Day).unwrap();
+        let png = render(&lines, Period::Day, &["ICPSwap"]).unwrap();
         assert_is_png(&png, HEIGHT + 2 * LEGEND_ROW_HEIGHT);
         save("wrapped", &png);
     }
@@ -562,7 +568,7 @@ mod tests {
                 points: &prices,
             })
             .collect();
-        let png = render(&lines, Period::Day).unwrap();
+        let png = render(&lines, Period::Day, &["ICPSwap"]).unwrap();
         assert_is_png(&png, HEIGHT);
         save("flat_several", &png);
     }
@@ -586,7 +592,7 @@ mod tests {
             name: "X",
             points: &prices,
         };
-        assert!(render(&[line], Period::Day).is_err());
+        assert!(render(&[line], Period::Day, &[]).is_err());
     }
 
     #[test]

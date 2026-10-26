@@ -110,7 +110,7 @@ impl Chart {
             ));
         }
 
-        let caption = credits(&providers(&charted));
+        let providers = providers(&charted);
         let png = tokio::task::spawn_blocking(move || {
             let lines: Vec<Line> = charted
                 .iter()
@@ -120,17 +120,17 @@ impl Chart {
                     points,
                 })
                 .collect();
-            render::render(&lines, period)
+            let names: Vec<&str> = providers.iter().map(|p| p.name()).collect();
+            render::render(&lines, period, &names)
         })
         .await
         .map_err(|e| internal("Rendering panicked", e))?
         .map_err(|e| internal("Failed to render the chart", e))?;
 
-        let mut image = oc_client
+        let image = oc_client
             .upload_image(self.storage_index, png, image::ImageFormat::Png)
             .await
             .map_err(|e| internal("Failed to upload the chart", e))?;
-        image.caption = Some(caption);
 
         let (message, response) = oc_client
             .send_message(MessageContentInitial::Image(image))
@@ -178,17 +178,6 @@ impl Chart {
             direct_messages: Some(true),
         }
     }
-}
-
-// Every source the prices came from, linked, eg. "Price data by [ICPSwap](https://www.icpswap.com)
-// and [CoinGecko](https://www.coingecko.com)". It's the caption, rather than in the image, as an
-// image can't link, and CoinGecko requires a linked credit.
-fn credits(providers: &[Provider]) -> String {
-    let links: Vec<String> = providers
-        .iter()
-        .map(|p| format!("[{}]({})", p.name(), p.url()))
-        .collect();
-    format!("Price data by {}", list(&links))
 }
 
 // Where the prices came from, each once
@@ -266,18 +255,6 @@ mod tests {
             source: Source::Icp(Principal::anonymous().into()),
             ..token(symbol)
         }
-    }
-
-    #[test]
-    fn every_source_is_credited_with_a_link() {
-        assert_eq!(
-            credits(&[Provider::IcpSwap]),
-            "Price data by [ICPSwap](https://www.icpswap.com)"
-        );
-        assert_eq!(
-            credits(&[Provider::IcpSwap, Provider::CoinGecko]),
-            "Price data by [ICPSwap](https://www.icpswap.com) and [CoinGecko](https://www.coingecko.com)"
-        );
     }
 
     #[test]
