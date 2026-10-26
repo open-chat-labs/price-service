@@ -318,10 +318,15 @@ cargo test -- --ignored
 
 To look at the charts the tests draw, set `CHART_OUTPUT_DIR` to a directory to save them to.
 
-The Rust SDK is a git dependency on
-[open-chat-bots#243](https://github.com/open-chat-labs/open-chat-bots/pull/243), for its upload
-support, until that's merged. `Cargo.lock` was seeded from open-chat-bots' lockfile, which pins
-`dataurl` 0.1.2, a version the SDK needs and crates.io has yanked, so keep it.
+The Rust SDK is a git dependency on [open-chat-bots](https://github.com/open-chat-labs/open-chat-bots)'
+`main`, as it isn't on crates.io. `Cargo.lock` pins its commit. To move to the latest:
+
+```bash
+cargo update -p oc_bots_sdk -p oc_bots_sdk_offchain
+```
+
+`Cargo.lock` was seeded from open-chat-bots' lockfile, which pins `dataurl` 0.1.2, a version the SDK
+needs and crates.io has yanked, so keep it.
 
 ## License
 
