@@ -217,6 +217,7 @@ managed through SSM.
   its own, beyond the free key's.
 - **Its own distribution:** OpenChat reads a bot's definition from its endpoint's root, so ChartBot
   can't share a distribution with the bridges.
+- **Its url:** `https://d2r0806cxz8193.cloudfront.net`, the distribution `E2LYK4LO2EO26X`.
 
 **To set it up**, once:
 
@@ -245,6 +246,8 @@ managed through SSM.
    - `logs:CreateLogStream` and `logs:PutLogEvents` on `/oc/price-service`.
 5. **Port 8082** in the instance's security group, admitted only from CloudFront's origin-facing
    prefix list, `com.amazonaws.global.cloudfront.origin-facing`. 8080 and 8081 are the bridges'.
+   - One rule admits all three ports. The prefix list counts as about 55 rules against the group's
+     limit of 60, so a second rule using it wouldn't fit.
 6. **The service,** a systemd unit and the script it runs before each start, from
    [`deploy/`](./deploy). Install them on the host, eg. through SSM Session Manager:
 
@@ -275,7 +278,9 @@ managed through SSM.
      as they were sent.
    - **Errors** are sent with `Cache-Control: no-store`. So that CloudFront can't hold on to a 503
      for its default 10 seconds, give 503 an error caching minimum TTL of 0.
-   - **Viewers:** redirect HTTP to HTTPS.
+   - **Viewers:** HTTPS only, as for the bridges.
+   - **Edge locations:** all of them, as the website's users are worldwide. The bridges' use only
+     North America's and Europe's.
 8. **The deploy role,** `GitHubActions-DeployPriceService`, which GitHub can assume only from `main`:
    - **Trust:** the OIDC provider `token.actions.githubusercontent.com`, with `aud`
      `sts.amazonaws.com` and `sub` `repo:open-chat-labs/price-service:ref:refs/heads/main`.

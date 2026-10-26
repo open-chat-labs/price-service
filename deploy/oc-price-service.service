@@ -26,6 +26,7 @@ ExecStart=/usr/bin/docker run --rm --name oc-price-service \
     --log-driver awslogs \
     --log-opt awslogs-region=us-east-1 \
     --log-opt awslogs-group=/oc/price-service \
+    --log-opt awslogs-stream=service \
     ${IMAGE}
 ExecStop=/usr/bin/docker stop oc-price-service
 Restart=always
