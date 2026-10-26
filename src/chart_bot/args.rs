@@ -25,19 +25,6 @@ fn parse_period(text: &str) -> Option<Period> {
     }
 }
 
-fn period_from_days(days: &str) -> Result<Period, String> {
-    match days.parse::<u32>() {
-        Ok(1) => Ok(Period::Day),
-        Ok(7) => Ok(Period::Week),
-        Ok(30) => Ok(Period::Month),
-        Ok(90) => Ok(Period::Quarter),
-        Ok(365) => Ok(Period::Year),
-        _ => Err(format!(
-            "Charts cover 1, 7, 30, 90 or 365 days, not {days}."
-        )),
-    }
-}
-
 pub fn parse(text: &str) -> Result<ChartArgs, String> {
     let mut words: Vec<&str> = text
         .split(|c: char| c.is_whitespace() || c == ',')
@@ -46,12 +33,14 @@ pub fn parse(text: &str) -> Result<ChartArgs, String> {
     let mut symbols: Vec<String> = Vec::new();
     let mut period = None;
 
-    // A number after the tokens is a number of days, eg. `/chart ICP 7`. Anywhere else it's a
-    // token, eg. `/chart 7`
+    // A number at the end is a number of days, eg. `/chart ICP 7`. On its own, or anywhere else,
+    // it's a token, eg. `/chart 7`
     if let [_, .., last] = words[..]
         && last.chars().all(|c| c.is_ascii_digit())
     {
-        period = Some(period_from_days(last)?);
+        let p = parse_period(&format!("{last}d"))
+            .ok_or_else(|| format!("Charts cover 1, 7, 30, 90 or 365 days, not {last}."))?;
+        period = Some(p);
         words.pop();
     }
 
@@ -165,7 +154,18 @@ mod tests {
             parse("ICP 14"),
             Err("Charts cover 1, 7, 30, 90 or 365 days, not 14.".to_string())
         );
-        assert!(parse("ICP 7d 30").is_err());
+    }
+
+    #[test]
+    fn a_number_at_the_end_is_a_period_like_any_other() {
+        assert_eq!(parse("ICP 7d 7").unwrap().period, Period::Week);
+        for text in ["ICP 7d 30", "30d 7"] {
+            assert_eq!(
+                parse(text),
+                Err("Give at most one period, eg. 30d.".to_string()),
+                "{text}"
+            );
+        }
     }
 
     #[test]
