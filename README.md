@@ -209,14 +209,89 @@ checkout `OPEN_CHAT_DIR` names.
 
 ### On AWS
 
-It isn't deployed yet. It's meant to run as a single container on a host that stays up, eg. EC2
-or ECS, rather than Lambda, so its cache is shared. It needs:
+It runs beside the Discord bridge, on its EC2 instance `i-0198f9d466e519454`, behind a CloudFront
+distribution of its own. The instance is an arm64 t4g.small running Amazon Linux 2023 in us-east-1,
+managed through SSM.
+- **Size:** in a local run it used about 7 MB of memory and next to no CPU.
+- **One copy only:** its prices are kept in memory, and a second copy would make CoinGecko calls of
+  its own, beyond the free key's.
+- **Its own distribution:** OpenChat reads a bot's definition from its endpoint's root, so ChartBot
+  can't share a distribution with the bridges.
 
-- HTTPS in front of it, eg. CloudFront.
-  - Its `Cache-Control` headers let the CDN answer most of the website's requests.
-  - It should forward `range`, the one query parameter.
-  - The bot's `POST /execute_command` mustn't be cached.
-- The environment variables below, with the identity kept secret, eg. in SSM Parameter Store.
+**To set it up**, once:
+
+1. **An ECR repository,** `oc-price-service`.
+2. **The config,** in SSM Parameter Store, which the host reads each time the service starts:
+   - `/oc-price-service/OC_IDENTITY_PEM`: a SecureString, the bot's identity, from
+     `dfx identity export chart_bot`.
+   - `/oc-price-service/COINGECKO_API_KEY`: a SecureString, a CoinGecko Demo key.
+   - `/oc-price-service/PUBLIC_URL`: a String, the CloudFront distribution's url, which the deploy
+     checks.
+   - Any other variable under [Configuration](#configuration) can be added the same way.
+3. **A CloudWatch log group,** `/oc/price-service`.
+4. **The instance's role** also needs:
+   - `ssm:GetParametersByPath` on `parameter/oc-price-service`, and `ssm:GetParameter` on
+     `parameter/oc-price-service/*`. Parameters encrypted with a key of your own need
+     `kms:Decrypt` on it too.
+   - To pull from the `oc-price-service` ECR repository: `ecr:BatchGetImage` and
+     `ecr:GetDownloadUrlForLayer`.
+   - `logs:CreateLogStream` and `logs:PutLogEvents` on `/oc/price-service`.
+5. **Port 8082** in the instance's security group, admitted only from CloudFront's origin-facing
+   prefix list, `com.amazonaws.global.cloudfront.origin-facing`. 8080 and 8081 are the bridges'.
+6. **The service,** a systemd unit and the script it runs before each start, from
+   [`deploy/`](./deploy). Install them on the host, eg. through SSM Session Manager:
+
+   ```bash
+   install -m 0755 oc-price-service-prepare /usr/local/bin/
+   install -m 0644 oc-price-service.service /etc/systemd/system/
+   systemctl daemon-reload && systemctl enable oc-price-service
+   ```
+
+   It starts on the first deploy, once there's an image. Each time it starts, it:
+   - pulls `oc-price-service:latest`;
+   - writes the config to `/run/oc-price-service`;
+   - runs the container on port 8082, as `nobody`, with its logs going to CloudWatch.
+
+   If it stops, it's restarted after 30 seconds. After 5 starts in an hour it's left stopped, as each
+   start calls CoinGecko.
+7. **A CloudFront distribution:**
+   - **Origin:** the instance's public DNS name, over HTTP on port 8082. Give it a 60-second
+     response timeout, as a chart on a cold cache can take that long.
+   - **`/v1/*`, the website's prices:** GET and HEAD, with a cache policy of its own, which:
+     - takes its TTLs from the service's `Cache-Control`: minimum 0, default 60 and maximum 300
+       seconds;
+     - includes the query string `range` in the cache key. `CachingOptimized` leaves query strings
+       out, which would mix up the 1d and 7d histories;
+     - enables gzip and Brotli.
+   - **The default behaviour, for ChartBot:** all methods, with the `CachingDisabled` cache policy
+     and the `AllViewerExceptHostHeader` origin request policy, so OpenChat's requests reach the bot
+     as they were sent.
+   - **Errors** are sent with `Cache-Control: no-store`. So that CloudFront can't hold on to a 503
+     for its default 10 seconds, give 503 an error caching minimum TTL of 0.
+   - **Viewers:** redirect HTTP to HTTPS.
+8. **The deploy role,** `GitHubActions-DeployPriceService`, which GitHub can assume only from `main`:
+   - **Trust:** the OIDC provider `token.actions.githubusercontent.com`, with `aud`
+     `sts.amazonaws.com` and `sub` `repo:open-chat-labs/price-service:ref:refs/heads/main`.
+   - **Permissions:**
+     - pushing to the `oc-price-service` ECR repository, plus `ecr:GetAuthorizationToken`;
+     - `ssm:SendCommand` on the instance with the `AWS-RunShellScript` document, and
+       `ssm:GetCommandInvocation`;
+     - `ssm:GetParameter` on `/oc-price-service/PUBLIC_URL`.
+   - `AWS-RunShellScript` runs any command on the host as root, so this role can do anything there,
+     as the bridges' deploy roles can.
+9. **Deploy it,** as below.
+10. **Register ChartBot** on OpenChat, with the distribution's url as its endpoint. Then build the
+    website with `OC_PRICE_SERVICE_URL` set to the same url.
+
+**Deploys** are done by the *Deploy* GitHub Actions workflow,
+[`deploy.yaml`](./.github/workflows/deploy.yaml), run by hand from `main`:
+- It builds the image on an arm64 runner, for the arm64 host, and pushes it to ECR, tagged `latest`
+  and with the commit.
+- It restarts the service through SSM. The config in Parameter Store stays as it is.
+- The deploy fails if the service doesn't start, doesn't stay up for 30 seconds, or doesn't serve
+  prices. It then checks ChartBot's definition through the distribution.
+- A pull request that changes the Dockerfile, the toolchain, the dependencies or the workflow only
+  builds the image.
 
 ## Configuration
 

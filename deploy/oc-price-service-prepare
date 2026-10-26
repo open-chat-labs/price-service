@@ -1,0 +1,27 @@
+#!/bin/bash
+# Run by oc-price-service.service before each start, as root: pulls the image from ECR, and writes
+# the config from SSM Parameter Store's /oc-price-service/* to /run/oc-price-service. The identity
+# goes to its own file, as a PEM spans lines, and everything else to an env file, one line each.
+set -euo pipefail
+
+image=$1
+dir=/run/oc-price-service
+
+aws ecr get-login-password | docker login --username AWS --password-stdin "${image%%/*}"
+docker pull "$image"
+
+# The container runs as nobody, who reads the identity
+install -d -m 0700 -o nobody -g nobody "$dir"
+umask 077
+: > "$dir/env"
+for name in $(aws ssm get-parameters-by-path --path /oc-price-service/ --query 'Parameters[].Name' --output text); do
+    value=$(aws ssm get-parameter --name "$name" --with-decryption --query Parameter.Value --output text)
+    case "${name##*/}" in
+        OC_IDENTITY_PEM) printf '%s\n' "$value" > "$dir/identity.pem" ;;
+        # Only the deploy reads it
+        PUBLIC_URL) ;;
+        *) printf '%s=%s\n' "${name##*/}" "$value" >> "$dir/env" ;;
+    esac
+done
+[ -s "$dir/identity.pem" ] || { echo "/oc-price-service/OC_IDENTITY_PEM isn't set"; exit 1; }
+chown nobody:nobody "$dir/identity.pem"

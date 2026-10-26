@@ -1,0 +1,37 @@
+# The price service, on the Discord bridge's EC2 host. Install it with the script it runs first:
+#   install -m 0755 oc-price-service-prepare /usr/local/bin/
+#   install -m 0644 oc-price-service.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now oc-price-service
+[Unit]
+Description=OpenChat price service: ChartBot and the website's prices
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+# Each start calls CoinGecko, whose free key allows 10,000 calls a month, so a service which keeps
+# failing is left stopped after 5 starts in an hour rather than restarted forever
+StartLimitIntervalSec=1h
+StartLimitBurst=5
+
+[Service]
+Environment=IMAGE=253040722768.dkr.ecr.us-east-1.amazonaws.com/oc-price-service:latest
+Environment=AWS_DEFAULT_REGION=us-east-1
+ExecStartPre=-/usr/bin/docker rm -f oc-price-service
+ExecStartPre=/usr/local/bin/oc-price-service-prepare ${IMAGE}
+# 8080 and 8081 are the Discord and Twitch bridges'
+ExecStart=/usr/bin/docker run --rm --name oc-price-service \
+    --publish 8082:8080 \
+    --env-file /run/oc-price-service/env \
+    --env OC_IDENTITY_PEM_FILE=/config/identity.pem \
+    --volume /run/oc-price-service/identity.pem:/config/identity.pem:ro \
+    --log-driver awslogs \
+    --log-opt awslogs-region=us-east-1 \
+    --log-opt awslogs-group=/oc/price-service \
+    ${IMAGE}
+ExecStop=/usr/bin/docker stop oc-price-service
+Restart=always
+RestartSec=30
+# Long enough for the pull
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

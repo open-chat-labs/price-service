@@ -1,0 +1,111 @@
+# Deploys the service to the Discord bridge's EC2 host: pushes its image to ECR as `latest`, then
+# restarts the host's service, which pulls `latest` as it starts. Only the image: the host's config,
+# including the bot's identity, stays as it is in SSM Parameter Store. The README says what it needs
+# in AWS.
+on:
+  workflow_dispatch:
+  # Builds it, without deploying, when this workflow, the Dockerfile, the toolchain or the
+  # dependencies change
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/deploy.yaml
+      - Dockerfile
+      - rust-toolchain.toml
+      - Cargo.lock
+
+name: Deploy
+
+# Deploys queue behind each other, apart from a PR's builds, which a newer push to the PR cancels
+concurrency:
+  group: deploy-${{ github.event_name == 'workflow_dispatch' && 'deploy' || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: 253040722768.dkr.ecr.us-east-1.amazonaws.com/oc-price-service
+  INSTANCE_ID: i-0198f9d466e519454
+
+jobs:
+  deploy:
+    name: Deploy
+    # The host is arm64, so this builds its image natively rather than under emulation
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      # The deploy role can only be assumed from main, so this fails early with a clearer error
+      - name: Ensure on main
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "Deploy from main, not ${GITHUB_REF}"
+          exit 1
+      - uses: actions/checkout@v4
+      # The Dockerfile pins the Rust version and builds with --locked
+      - name: Build
+        run: docker build --platform linux/arm64 -t "$IMAGE:${GITHUB_SHA::10}" -t "$IMAGE:latest" .
+      - name: Configure AWS credentials
+        if: github.event_name == 'workflow_dispatch'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::253040722768:role/GitHubActions-DeployPriceService
+          aws-region: us-east-1
+      # The CloudFront distribution's url, to check the service answers there
+      - name: Read the public url
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          public_url=$(aws ssm get-parameter --name /oc-price-service/PUBLIC_URL --with-decryption --query Parameter.Value --output text)
+          echo "PUBLIC_URL=${public_url%/}" >> "$GITHUB_ENV"
+      - name: Push
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${IMAGE%%/*}"
+          docker push "$IMAGE:${GITHUB_SHA::10}"
+          docker push "$IMAGE:latest"
+      # The unit gives up after 5 starts in an hour, as each start calls CoinGecko, so a deploy
+      # clears that first. If the service doesn't start and stay up, the deploy fails, and the unit
+      # tries a few more times before giving up.
+      - name: Restart the service
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          script='set -eu
+          systemctl reset-failed oc-price-service || true
+          systemctl restart oc-price-service || { echo "The service did not start. Its logs are in CloudWatch, in /oc/price-service."; exit 1; }
+          pid=$(systemctl show -p MainPID --value oc-price-service)
+          sleep 30
+          if ! systemctl is-active -q oc-price-service || [ "$(systemctl show -p MainPID --value oc-price-service)" != "$pid" ]; then
+            echo "The service did not stay up. Its logs are in CloudWatch, in /oc/price-service."
+            exit 1
+          fi
+          # The prices load within seconds of starting
+          if ! curl -fsS --retry 6 --retry-delay 5 --retry-all-errors -o /dev/null http://localhost:8082/v1/prices; then
+            echo "The service is up but not serving prices. Its logs are in CloudWatch, in /oc/price-service."
+            exit 1
+          fi
+          docker inspect --format "Running {{.Config.Image}} ({{.Image}})" oc-price-service
+          # The previous image, which each deploy leaves untagged. Pruning fails while a bridge
+          # deploy prunes the same host, which is no reason to fail this one.
+          docker image prune -f || true'
+          # A command the host doesn't pick up within 60s is dropped, rather than restarting the
+          # service later, after this run has given up on it
+          id=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript \
+            --timeout-seconds 60 --comment "Deploy the price service at ${GITHUB_SHA::10}" \
+            --parameters "$(jq -n --arg script "$script" '{commands: [$script]}')" \
+            --query Command.CommandId --output text)
+          # Up to 5 minutes, for the pull and the checks. The invocation may not exist at first.
+          for _ in $(seq 60); do
+            sleep 5
+            status=$(aws ssm get-command-invocation --command-id "$id" --instance-id "$INSTANCE_ID" --query Status --output text 2>/dev/null) || status=Pending
+            case "$status" in Pending|InProgress|Delayed) ;; *) break ;; esac
+          done
+          aws ssm get-command-invocation --command-id "$id" --instance-id "$INSTANCE_ID" \
+            --query '[StandardOutputContent, StandardErrorContent]' --output text
+          echo "Restart: $status"
+          [ "$status" = Success ]
+      # Through CloudFront, which doesn't cache ChartBot's definition
+      - name: Check it's up
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          curl -fsS --retry 5 --retry-delay 5 --retry-all-errors "$PUBLIC_URL/bot_definition" > /dev/null
+          echo "Deployed ${GITHUB_SHA} and it's serving ${PUBLIC_URL}"
