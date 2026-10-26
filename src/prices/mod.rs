@@ -26,6 +26,7 @@ pub use period::Period;
 pub use refresh::spawn as spawn_refresh;
 
 const HOUR: Duration = Duration::from_secs(60 * 60);
+const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PricePoint {
@@ -114,14 +115,15 @@ impl From<anyhow::Error> for PriceError {
     }
 }
 
-/// Prices for ChartBot, which can chart any token. Those OpenChat lists come from the market, as
-/// far back as it goes, and otherwise from their source.
+/// Prices for ChartBot, which can chart any token. Its last week comes from the market, which keeps
+/// it up to date, and anything older from its source.
 pub struct Prices {
     market: Arc<Market>,
     coingecko: Arc<CoinGecko>,
     icpswap: Arc<IcpSwap>,
     found: Cache<String, Option<Token>>,
-    histories: Cache<(Source, Period), Vec<PricePoint>>,
+    /// The prices fetched from the sources, each with when it was fetched
+    fetched: Cache<(Source, Period), (TimestampMillis, Vec<PricePoint>)>,
 }
 
 impl Prices {
@@ -131,7 +133,7 @@ impl Prices {
             coingecko,
             icpswap,
             found: Cache::default(),
-            histories: Cache::default(),
+            fetched: Cache::default(),
         }
     }
 
@@ -175,33 +177,60 @@ impl Prices {
         token: &Token,
         period: Period,
     ) -> Result<Vec<PricePoint>, PriceError> {
-        // The market goes back a week
-        let from_market = match &token.source {
-            Source::Icp(ledger) if period.days() <= 7 || self.market.is_pinned(*ledger) => {
-                self.market.history(*ledger, period, now())
-            }
-            Source::CoinGecko(id) if period.days() <= 7 => {
-                self.market.coin_history(id, period, now())
-            }
-            _ => History::NotLoaded,
+        let now = now();
+        let pinned = matches!(&token.source, Source::Icp(ledger) if self.market.is_pinned(*ledger));
+        // The market has the last week or so of the tokens OpenChat lists and the largest coins,
+        // and has stablecoins at $1 for any period
+        let up_to_a_week = if period.days() <= 7 || pinned {
+            period
+        } else {
+            Period::Week
         };
-        if let History::Points(points) = from_market {
+        let from_market = match &token.source {
+            Source::Icp(ledger) => self.market.history(*ledger, up_to_a_week, now),
+            Source::CoinGecko(id) => self.market.coin_history(id, up_to_a_week, now),
+        };
+        let week = match from_market {
+            History::Points(points) if up_to_a_week == period => return Ok(points),
+            History::Points(points) => Some(points),
+            _ => None,
+        };
+
+        // Prices more than a week old don't change, so with the market's week, what was fetched is
+        // good for a day
+        let max_age = if week.is_some() {
+            DAY
+        } else {
+            cache_duration(period)
+        };
+        let fetched = self.fetch(&token.source, period, max_age, now).await?;
+        let points = match week {
+            Some(week) => join(fetched, week),
+            None => fetched,
+        };
+        Ok(within_period(points, period, now))
+    }
+
+    // The source's prices over the period, fetched within `max_age`
+    async fn fetch(
+        &self,
+        source: &Source,
+        period: Period,
+        max_age: Duration,
+        now: TimestampMillis,
+    ) -> Result<Vec<PricePoint>, PriceError> {
+        let key = (source.clone(), period);
+        if let Some((fetched_at, points)) = self.fetched.get(&key)
+            && now.saturating_sub(fetched_at) < max_age.as_millis() as u64
+        {
             return Ok(points);
         }
 
-        let key = (token.source.clone(), period);
-        if let Some(points) = self.histories.get(&key) {
-            return Ok(points);
-        }
-
-        let points = match &token.source {
+        let points = match source {
             Source::Icp(ledger) => outliers::filter(self.icpswap.history(*ledger, period).await?),
             Source::CoinGecko(id) => self.coingecko.history(id, period).await?,
         };
-        let points = within_period(points, period, now());
-
-        self.histories
-            .insert(key, points.clone(), cache_duration(period));
+        self.fetched.insert(key, (now, points.clone()), DAY);
         Ok(points)
     }
 }
@@ -229,7 +258,36 @@ fn find_listed(tokens: &[ListedToken], symbol: &str) -> Option<Token> {
         })
 }
 
-// Recent periods are cached more briefly, as their latest price matters more
+// The fetched prices from before the week, then the week's. The week's are thinned out to the
+// fetched prices' spacing, eg. daily for a year, so the chart looks the same throughout, keeping its
+// last, the latest price.
+fn join(fetched: Vec<PricePoint>, week: Vec<PricePoint>) -> Vec<PricePoint> {
+    let Some(start) = week.first().map(|p| p.time) else {
+        return fetched;
+    };
+    let mut joined: Vec<PricePoint> = fetched.into_iter().filter(|p| p.time < start).collect();
+    let spacing = median_spacing(&joined);
+
+    let last = week.len() - 1;
+    let mut previous: Option<TimestampMillis> = None;
+    for (i, point) in week.into_iter().enumerate() {
+        if i == last || previous.is_none_or(|time| point.time - time >= spacing) {
+            joined.push(point);
+            previous = Some(point.time);
+        }
+    }
+    joined
+}
+
+fn median_spacing(points: &[PricePoint]) -> TimestampMillis {
+    let mut spacings: Vec<TimestampMillis> =
+        points.windows(2).map(|w| w[1].time - w[0].time).collect();
+    spacings.sort_unstable();
+    spacings.get(spacings.len() / 2).copied().unwrap_or(0)
+}
+
+// Without the market's week, recent periods are fetched again sooner, as their latest price matters
+// more
 fn cache_duration(period: Period) -> Duration {
     match period {
         Period::Day => Duration::from_secs(5 * 60),
@@ -266,6 +324,7 @@ pub fn now() -> TimestampMillis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coingecko::CoinMarket;
     use ic_agent::export::Principal;
 
     #[test]
@@ -356,5 +415,136 @@ mod tests {
         let day = Period::Day.millis();
         let points = vec![point(9 * day, 2.0), point(10 * day, 3.0)];
         assert_eq!(within_period(points.clone(), Period::Day, 10 * day), points);
+    }
+
+    const HOUR_MS: u64 = 60 * 60 * 1000;
+    const DAY_MS: u64 = 24 * HOUR_MS;
+
+    #[test]
+    fn the_week_is_joined_to_what_was_fetched_at_its_spacing() {
+        // Daily prices up to day 99, and the market's hourly week from day 93 to its latest price
+        let fetched: Vec<_> = (80..100).map(|d| point(d * DAY_MS, 1.0)).collect();
+        let week: Vec<_> = (0..168)
+            .map(|h| point(93 * DAY_MS + h * HOUR_MS, 2.0))
+            .chain([point(100 * DAY_MS, 3.0)])
+            .collect();
+
+        let joined = join(fetched, week);
+        let days: Vec<u64> = joined.iter().map(|p| p.time / DAY_MS).collect();
+        assert_eq!(days, (80..=100).collect::<Vec<_>>());
+        assert!(joined.iter().all(|p| p.time % DAY_MS == 0));
+        assert_eq!(joined[12].price, 1.0, "day 92 is fetched");
+        assert_eq!(joined[13].price, 2.0, "day 93 is the market's");
+        assert_eq!(joined.last().unwrap().price, 3.0);
+    }
+
+    #[test]
+    fn an_hourly_week_is_kept_whole_after_hourly_prices() {
+        let fetched: Vec<_> = (0..24 * 30).map(|h| point(h * HOUR_MS, 1.0)).collect();
+        let week: Vec<_> = (0..169)
+            .map(|h| point(23 * DAY_MS + h * HOUR_MS, 2.0))
+            .collect();
+
+        let joined = join(fetched, week.clone());
+        assert_eq!(joined.len(), 23 * 24 + 169);
+        assert_eq!(&joined[23 * 24..], week);
+    }
+
+    // Prices whose price APIs can't be reached, so whatever they'd fetch fails
+    fn offline_prices(market: Arc<Market>) -> Prices {
+        let http = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .build()
+            .unwrap();
+        Prices::new(
+            market,
+            Arc::new(CoinGecko::new(http.clone(), None)),
+            Arc::new(IcpSwap::new(http)),
+        )
+    }
+
+    // The market has ADA's last week, at 0.2, and its latest price, 0.3
+    fn market_with_ada(now: TimestampMillis) -> Arc<Market> {
+        let market = Arc::new(Market::new(std::collections::HashMap::new()));
+        market.set_listed(Vec::new());
+        market.set_coins(
+            vec![CoinMarket {
+                id: "cardano".to_string(),
+                symbol: "ada".to_string(),
+                name: "Cardano".to_string(),
+                usd: 0.3,
+                updated: now,
+                sparkline: vec![0.2; 168],
+            }],
+            now,
+        );
+        market
+    }
+
+    fn coin(id: &str) -> Token {
+        Token {
+            symbol: id.to_uppercase(),
+            name: id.to_string(),
+            source: Source::CoinGecko(id.to_string()),
+        }
+    }
+
+    // Daily prices at 0.5, for a little over a year up to `until`
+    fn fetched_year(until: TimestampMillis) -> Vec<PricePoint> {
+        (0..=366)
+            .map(|d| point(until - (366 - d) * DAY_MS, 0.5))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_year_fetched_hours_ago_is_joined_to_the_markets_week_without_fetching_again() {
+        let now = now();
+        let prices = offline_prices(market_with_ada(now));
+        let fetched_at = now - 4 * HOUR_MS;
+        prices.fetched.insert(
+            (coin("cardano").source, Period::Year),
+            (fetched_at, fetched_year(fetched_at)),
+            DAY,
+        );
+
+        let points = prices
+            .history(&coin("cardano"), Period::Year)
+            .await
+            .unwrap();
+
+        // From the year's start, a fetched price a day until the market's week, then the week a
+        // day at a time, then the latest price
+        assert!(points[0].time >= now - Period::Year.millis());
+        assert!(points.windows(2).all(|w| w[0].time < w[1].time));
+        let at = |price: f64| points.iter().filter(|p| p.price == price).count();
+        assert_eq!(at(0.5), 359);
+        assert_eq!(at(0.2), 7);
+        assert_eq!(*points.last().unwrap(), point(now, 0.3));
+    }
+
+    #[tokio::test]
+    async fn without_the_markets_week_a_year_is_fetched_again_after_an_hour() {
+        let now = now();
+        let prices = offline_prices(market_with_ada(now));
+        // CoinGecko's Solchat, which isn't among the largest coins
+        let key = (coin("solchat").source, Period::Year);
+
+        let fetched_at = now - 30 * 60 * 1000;
+        prices
+            .fetched
+            .insert(key.clone(), (fetched_at, fetched_year(fetched_at)), DAY);
+        assert!(prices.history(&coin("solchat"), Period::Year).await.is_ok());
+
+        // It's fetched again, which fails offline
+        let fetched_at = now - 2 * HOUR_MS;
+        prices
+            .fetched
+            .insert(key, (fetched_at, fetched_year(fetched_at)), DAY);
+        assert!(
+            prices
+                .history(&coin("solchat"), Period::Year)
+                .await
+                .is_err()
+        );
     }
 }

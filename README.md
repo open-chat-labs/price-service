@@ -137,7 +137,12 @@ API in [`src/api.rs`](./src/api.rs), and the bot in [`src/chart_bot`](./src/char
 - **Caching and limits:** everything is cached in memory, so a restart starts cold.
   - Tokens OpenChat lists, and the 250 largest coins, are charted from the price API's prices for
     1d and 7d. The coins also resolve symbols without a call.
-  - Other prices are cached for 5 minutes for 1d, 15 minutes for 7d and an hour beyond.
+  - **Longer charts** (30d, 90d and 1y) of those tokens fetch their history once a day, as prices
+    more than a week old don't change. Each chart joins it to the market's last week, which is kept
+    up to date, thinned to the history's spacing, eg. a price a day for a year. So a coin's 1y chart
+    costs one CoinGecko call a day, however often it's asked for.
+  - Other tokens' prices are fetched again after 5 minutes for 1d, 15 minutes for 7d and an hour
+    beyond.
   - Which token a symbol means is cached for an hour. Only a symbol outside OpenChat's tokens and the
     250 largest coins asks CoinGecko.
   - Without an API key, CoinGecko allows only a few calls a minute from an address. The service
