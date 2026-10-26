@@ -24,17 +24,6 @@ impl Period {
     pub fn millis(self) -> u64 {
         self.days() as u64 * 24 * 60 * 60 * 1000
     }
-
-    /// eg. the 7d in "CHAT $0.2345 (+5.2% 7d)"
-    pub fn short(self) -> &'static str {
-        match self {
-            Period::Day => "24h",
-            Period::Week => "7d",
-            Period::Month => "30d",
-            Period::Quarter => "90d",
-            Period::Year => "1y",
-        }
-    }
 }
 
 // As in "the past 7 days"

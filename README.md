@@ -95,9 +95,9 @@ The period is optional and goes anywhere: `1d`, `7d` (the default), `30d`, `90d`
 `24h`, `1w`, `1m`, `3m`, `12m`. Up to 5 tokens can be charted at once. Symbols are matched ignoring
 case, and a leading `$` is ignored.
 
-The chart is posted as an image. It and its caption give each token's price at the start of the
-period and now, and its change, eg. `CHAT $0.2229 → $0.2345 (+5.2% 7d)`. If a token can't be
-found, or there aren't enough prices for it, only whoever ran the command is told.
+The chart is posted as an image, which gives each token's price at the start of the period and
+now, and its change. It has no caption, unless it credits CoinGecko (see below). If a token can't
+be found, or there aren't enough prices for it, only whoever ran the command is told.
 
 ![/chart CHAT ICP ckBTC 30d](./docs/example.png)
 
@@ -114,7 +114,8 @@ found, or there aren't enough prices for it, only whoever ran the command is tol
     40-90 KB, so that's roughly 15,000 charts, after which uploads fail.
   - A group's or community's files are only deleted with it.
 - **Credits:** the chart's footer names where its prices are from. When CoinGecko's are charted,
-  the caption ends with "Price data by CoinGecko", linked, as CoinGecko's free API requires.
+  the image's caption is "Price data by CoinGecko", linked, as CoinGecko's free API requires a
+  linked credit, which an image can't have.
 
 ## Where ChartBot's prices come from
 

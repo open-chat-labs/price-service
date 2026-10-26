@@ -104,7 +104,7 @@ static FONTS: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
 });
 
 /// The change from the line's first point to its last, in percent
-pub fn change(points: &[PricePoint]) -> Option<f64> {
+fn change(points: &[PricePoint]) -> Option<f64> {
     let (first, last) = (points.first()?, points.last()?);
     (first.price > 0.0).then(|| (last.price / first.price - 1.0) * 100.0)
 }

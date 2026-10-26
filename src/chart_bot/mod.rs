@@ -111,7 +111,7 @@ impl Chart {
         }
 
         let providers = providers(&charted);
-        let caption = caption(&charted, period.short(), &providers);
+        let caption = credits(&providers);
         let png = tokio::task::spawn_blocking(move || {
             let lines: Vec<Line> = charted
                 .iter()
@@ -132,7 +132,7 @@ impl Chart {
             .upload_image(self.storage_index, png, image::ImageFormat::Png)
             .await
             .map_err(|e| internal("Failed to upload the chart", e))?;
-        image.caption = Some(caption);
+        image.caption = caption;
 
         let (message, response) = oc_client
             .send_message(MessageContentInitial::Image(image))
@@ -182,29 +182,15 @@ impl Chart {
     }
 }
 
-// Each token's price at the start of the period and now, and its change, eg.
-// "CHAT $0.2229 → $0.2345 (+5.2% 7d)", then a linked credit for the sources which require one
-fn caption(charted: &[(Token, Vec<PricePoint>)], period: &str, providers: &[Provider]) -> String {
-    let credits = providers
+// The image can't link, so the caption credits the sources which require a linked credit, eg.
+// "Price data by [CoinGecko](https://www.coingecko.com)". The image shows everything else.
+fn credits(providers: &[Provider]) -> Option<String> {
+    let credits: Vec<String> = providers
         .iter()
         .filter(|p| p.attribution_required())
-        .map(|p| format!("Price data by [{}]({})", p.name(), p.url()));
-    charted
-        .iter()
-        .map(|(token, points)| {
-            let range = format::usd_range(points[0].price, points.last().unwrap().price);
-            match render::change(points) {
-                Some(change) => format!(
-                    "{} {range} ({} {period})",
-                    token.symbol,
-                    format::change(change)
-                ),
-                None => format!("{} {range}", token.symbol),
-            }
-        })
-        .chain(credits)
-        .collect::<Vec<_>>()
-        .join("\n")
+        .map(|p| format!("Price data by [{}]({})", p.name(), p.url()))
+        .collect();
+    (!credits.is_empty()).then(|| credits.join("\n"))
 }
 
 // Where the prices came from, each once
@@ -285,27 +271,11 @@ mod tests {
     }
 
     #[test]
-    fn the_caption_has_each_tokens_start_and_end_prices_and_change() {
-        let charted = vec![
-            (icp_token("CHAT"), points(&[0.2, 0.3, 0.25])),
-            (icp_token("ICP"), points(&[5.0, 4.5])),
-        ];
+    fn only_sources_which_require_it_are_credited_with_a_link() {
+        assert_eq!(credits(&[Provider::IcpSwap]), None);
         assert_eq!(
-            caption(&charted, "7d", &providers(&charted)),
-            "CHAT $0.2000 → $0.2500 (+25.0% 7d)\nICP $5.00 → $4.50 (-10.0% 7d)"
-        );
-    }
-
-    #[test]
-    fn the_caption_credits_coingecko_with_a_link() {
-        let charted = vec![
-            (icp_token("CHAT"), points(&[0.2, 0.25])),
-            (token("ADA"), points(&[0.5, 0.4])),
-        ];
-        assert_eq!(
-            caption(&charted, "7d", &providers(&charted)),
-            "CHAT $0.2000 → $0.2500 (+25.0% 7d)\nADA $0.5000 → $0.4000 (-20.0% 7d)\n\
-             Price data by [CoinGecko](https://www.coingecko.com)"
+            credits(&[Provider::IcpSwap, Provider::CoinGecko]).as_deref(),
+            Some("Price data by [CoinGecko](https://www.coingecko.com)")
         );
     }
 
