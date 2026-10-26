@@ -96,8 +96,8 @@ The period is optional and goes anywhere: `1d`, `7d` (the default), `30d`, `90d`
 case, and a leading `$` is ignored.
 
 The chart is posted as an image, which gives each token's price at the start of the period and
-now, and its change. It has no caption, unless it credits CoinGecko (see below). If a token can't
-be found, or there aren't enough prices for it, only whoever ran the command is told.
+now, and its change. Its caption credits where the prices came from. If a token can't be found, or
+there aren't enough prices for it, only whoever ran the command is told.
 
 ![/chart CHAT ICP ckBTC 30d](./docs/example.png)
 
@@ -113,9 +113,9 @@ be found, or there aren't enough prices for it, only whoever ran the command is 
   - OpenChat gives a bot an upload allowance of 1 GB when it's registered. A chart is about
     40-90 KB, so that's roughly 15,000 charts, after which uploads fail.
   - A group's or community's files are only deleted with it.
-- **Credits:** the chart's footer names where its prices are from. When CoinGecko's are charted,
-  the image's caption is "Price data by CoinGecko", linked, as CoinGecko's free API requires a
-  linked credit, which an image can't have.
+- **Credits:** the image's caption credits every source its prices came from, linked, eg. "Price
+  data by ICPSwap and CoinGecko". It's in the caption, rather than the image, as an image can't
+  link, and CoinGecko's free API requires a linked credit.
 
 ## Where ChartBot's prices come from
 

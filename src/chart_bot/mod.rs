@@ -110,8 +110,7 @@ impl Chart {
             ));
         }
 
-        let providers = providers(&charted);
-        let caption = credits(&providers);
+        let caption = credits(&providers(&charted));
         let png = tokio::task::spawn_blocking(move || {
             let lines: Vec<Line> = charted
                 .iter()
@@ -121,8 +120,7 @@ impl Chart {
                     points,
                 })
                 .collect();
-            let names: Vec<&str> = providers.iter().map(|p| p.name()).collect();
-            render::render(&lines, period, &names)
+            render::render(&lines, period)
         })
         .await
         .map_err(|e| internal("Rendering panicked", e))?
@@ -132,7 +130,7 @@ impl Chart {
             .upload_image(self.storage_index, png, image::ImageFormat::Png)
             .await
             .map_err(|e| internal("Failed to upload the chart", e))?;
-        image.caption = caption;
+        image.caption = Some(caption);
 
         let (message, response) = oc_client
             .send_message(MessageContentInitial::Image(image))
@@ -182,15 +180,15 @@ impl Chart {
     }
 }
 
-// The image can't link, so the caption credits the sources which require a linked credit, eg.
-// "Price data by [CoinGecko](https://www.coingecko.com)". The image shows everything else.
-fn credits(providers: &[Provider]) -> Option<String> {
-    let credits: Vec<String> = providers
+// Every source the prices came from, linked, eg. "Price data by [ICPSwap](https://www.icpswap.com)
+// and [CoinGecko](https://www.coingecko.com)". It's the caption, rather than in the image, as an
+// image can't link, and CoinGecko requires a linked credit.
+fn credits(providers: &[Provider]) -> String {
+    let links: Vec<String> = providers
         .iter()
-        .filter(|p| p.attribution_required())
-        .map(|p| format!("Price data by [{}]({})", p.name(), p.url()))
+        .map(|p| format!("[{}]({})", p.name(), p.url()))
         .collect();
-    (!credits.is_empty()).then(|| credits.join("\n"))
+    format!("Price data by {}", list(&links))
 }
 
 // Where the prices came from, each once
@@ -271,11 +269,14 @@ mod tests {
     }
 
     #[test]
-    fn only_sources_which_require_it_are_credited_with_a_link() {
-        assert_eq!(credits(&[Provider::IcpSwap]), None);
+    fn every_source_is_credited_with_a_link() {
         assert_eq!(
-            credits(&[Provider::IcpSwap, Provider::CoinGecko]).as_deref(),
-            Some("Price data by [CoinGecko](https://www.coingecko.com)")
+            credits(&[Provider::IcpSwap]),
+            "Price data by [ICPSwap](https://www.icpswap.com)"
+        );
+        assert_eq!(
+            credits(&[Provider::IcpSwap, Provider::CoinGecko]),
+            "Price data by [ICPSwap](https://www.icpswap.com) and [CoinGecko](https://www.coingecko.com)"
         );
     }
 
