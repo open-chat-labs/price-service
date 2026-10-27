@@ -26,13 +26,25 @@ fn parse_period(text: &str) -> Option<Period> {
 }
 
 pub fn parse(text: &str) -> Result<ChartArgs, String> {
+    let mut words: Vec<&str> = text
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|w| !w.is_empty())
+        .collect();
     let mut symbols: Vec<String> = Vec::new();
     let mut period = None;
 
-    for word in text
-        .split(|c: char| c.is_whitespace() || c == ',')
-        .filter(|w| !w.is_empty())
+    // A number at the end is a number of days, eg. `/chart ICP 7`. On its own, or anywhere else,
+    // it's a token, eg. `/chart 7`
+    if let [_, .., last] = words[..]
+        && last.chars().all(|c| c.is_ascii_digit())
     {
+        let p = parse_period(&format!("{last}d"))
+            .ok_or_else(|| format!("Charts cover 1, 7, 30, 90 or 365 days, not {last}."))?;
+        period = Some(p);
+        words.pop();
+    }
+
+    for word in words {
         if let Some(p) = parse_period(word) {
             if period.replace(p).is_some_and(|previous| previous != p) {
                 return Err("Give at most one period, eg. 30d.".to_string());
@@ -119,6 +131,52 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn a_number_at_the_end_is_a_number_of_days() {
+        for (text, period) in [
+            ("1", Period::Day),
+            ("7", Period::Week),
+            ("30", Period::Month),
+            ("90", Period::Quarter),
+            ("365", Period::Year),
+        ] {
+            let args = parse(&format!("CHAT ICP {text}")).unwrap();
+            assert_eq!(symbols(&args), ["CHAT", "ICP"], "{text}");
+            assert_eq!(args.period, period, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_number_of_days_we_dont_chart_is_an_error() {
+        assert_eq!(
+            parse("ICP 14"),
+            Err("Charts cover 1, 7, 30, 90 or 365 days, not 14.".to_string())
+        );
+    }
+
+    #[test]
+    fn a_number_at_the_end_is_a_period_like_any_other() {
+        assert_eq!(parse("ICP 7d 7").unwrap().period, Period::Week);
+        for text in ["ICP 7d 30", "30d 7"] {
+            assert_eq!(
+                parse(text),
+                Err("Give at most one period, eg. 30d.".to_string()),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_number_anywhere_else_is_a_token() {
+        assert_eq!(symbols(&parse("7").unwrap()), ["7"]);
+        let args = parse("7 ICP").unwrap();
+        assert_eq!(symbols(&args), ["7", "ICP"]);
+        assert_eq!(args.period, Period::Week);
+        let args = parse("ICP $7").unwrap();
+        assert_eq!(symbols(&args), ["ICP", "7"]);
+        assert_eq!(args.period, Period::Week);
     }
 
     #[test]
