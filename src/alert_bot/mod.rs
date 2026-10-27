@@ -1,0 +1,583 @@
+//! PriceAlertBot, which tells someone, in the chat where they asked, when a token's price goes above
+//! or below one they gave: `/alert CHAT above 0.05`. `/alerts` lists theirs in the chat, and
+//! `/remove_alert` removes one. Prices come from the same market as ChartBot's and the website's,
+//! and the alerts are checked each time it refreshes. See the README.
+
+use crate::bot;
+use crate::chart_bot::format;
+use crate::prices::{Market, PriceError, Prices, Source, now};
+use args::AlertArgs;
+use async_trait::async_trait;
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::routing::post;
+use oc_bots_sdk::api::command::{
+    CommandHandler, CommandHandlerRegistry, EphemeralMessageBuilder, SuccessResult,
+};
+use oc_bots_sdk::api::definition::{
+    AutonomousConfig, BotCommandDefinition, BotCommandParam, BotCommandParamType, BotDefinition,
+    IntegerParam, StringParam,
+};
+use oc_bots_sdk::api::event_notification::{BotEvent, BotEventWrapper, BotLifecycleEvent};
+use oc_bots_sdk::oc_api::actions::{ActionArgsBuilder, send_message};
+use oc_bots_sdk::oc_api::client::{Client, ClientFactory};
+use oc_bots_sdk::types::{
+    ActionContext, ActionScope, AutonomousContext, BotCommandContext, BotPermissions,
+    InstallationLocationType, MessageContentInitial, MessagePermission,
+};
+use oc_bots_sdk_offchain::AgentRuntime;
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock};
+use store::{Alert, MAX_PER_USER_PER_CHAT};
+use tracing::{error, info, warn};
+
+mod args;
+mod store;
+
+pub use store::Alerts;
+
+const SOMETHING_WENT_WRONG: &str = "Something went wrong. Please try again.";
+
+/// PriceAlertBot's routes: its definition, commands and notifications, which OpenChat sends it when
+/// it's uninstalled from a chat
+pub fn routes(
+    client_factory: Arc<ClientFactory<AgentRuntime>>,
+    prices: Arc<Prices>,
+    market: Arc<Market>,
+    alerts: Arc<Alerts>,
+    oc_public_key: String,
+) -> Router {
+    let state = Arc::new(BotState {
+        prices,
+        market,
+        alerts: alerts.clone(),
+    });
+    let commands = CommandHandlerRegistry::new(client_factory)
+        .register(SetAlert(state.clone()))
+        .register(ListAlerts(state.clone()))
+        .register(RemoveAlert(state));
+    let notifications = Router::new()
+        .route("/notify", post(notify))
+        .with_state(Arc::new(Notifications {
+            alerts,
+            oc_public_key: oc_public_key.clone(),
+        }));
+    bot::routes(definition(commands.definitions()), oc_public_key, commands).merge(notifications)
+}
+
+/// PriceAlertBot's definition, which OpenChat reads from its endpoint. Its commands only reply
+/// privately, so need no permissions. It needs to send text on its own, to post alerts as they
+/// fire. It's for groups and channels: alerts by direct message are left for later.
+pub fn definition(commands: Vec<BotCommandDefinition>) -> BotDefinition {
+    BotDefinition {
+        description: "Tells you here when a token's price goes above or below one you give. Try \
+            /alert CHAT above 0.05. /alerts lists yours, and /remove_alert removes one."
+            .to_string(),
+        commands,
+        autonomous_config: Some(AutonomousConfig {
+            permissions: BotPermissions::default()
+                .with_message(&HashSet::from([MessagePermission::Text])),
+        }),
+        default_subscriptions: None,
+        restricted_locations: Some(HashSet::from([
+            InstallationLocationType::Community,
+            InstallationLocationType::Group,
+        ])),
+    }
+}
+
+/// Checks the alerts each time the market's prices refresh, posting each that's met in its chat,
+/// then removing it, so that it fires once
+pub fn spawn_checker(
+    client_factory: Arc<ClientFactory<AgentRuntime>>,
+    market: Arc<Market>,
+    alerts: Arc<Alerts>,
+) {
+    let mut refreshed = market.refreshed();
+    tokio::spawn(async move {
+        while refreshed.changed().await.is_ok() {
+            let now = now();
+            for (alert, price) in met(&alerts.all(), |source| market.price(source, now)) {
+                fire(&client_factory, &alerts, &alert, price).await;
+            }
+        }
+    });
+}
+
+struct BotState {
+    prices: Arc<Prices>,
+    market: Arc<Market>,
+    alerts: Arc<Alerts>,
+}
+
+// The alerts whose prices have reached their targets, each with its price
+fn met(alerts: &[Alert], price: impl Fn(&Source) -> Option<f64>) -> Vec<(Alert, f64)> {
+    alerts
+        .iter()
+        .filter_map(|alert| {
+            let price = price(&alert.source)?;
+            alert
+                .direction
+                .is_met(price, alert.target)
+                .then(|| (alert.clone(), price))
+        })
+        .collect()
+}
+
+// Posts the alert in its chat, mentioning who set it. It's removed once posted, or if OpenChat
+// refuses it, eg. as the bot was removed from the chat, so that it isn't tried again every minute.
+// It's kept, to be tried again, only if OpenChat couldn't be reached.
+async fn fire(
+    client_factory: &ClientFactory<AgentRuntime>,
+    alerts: &Alerts,
+    alert: &Alert,
+    price: f64,
+) {
+    let client = client_factory.build(AutonomousContext {
+        api_gateway: alert.api_gateway,
+        scope: ActionScope::Chat(alert.chat),
+    });
+    let response = client
+        .send_message(MessageContentInitial::from_text(fired(alert, price)))
+        .execute_async()
+        .await;
+    match response {
+        Ok(send_message::Response::Success(_)) => {
+            info!(id = alert.id, symbol = alert.symbol, "Posted an alert")
+        }
+        Ok(send_message::Response::Error(e)) => {
+            warn!(id = alert.id, chat = ?alert.chat, error = ?e, "OpenChat refused an alert, so it's dropped")
+        }
+        Err(e) => {
+            warn!(id = alert.id, error = ?e, "Failed to post an alert, so it'll be tried again");
+            return;
+        }
+    }
+    if let Err(e) = alerts.remove(alert.id) {
+        error!(id = alert.id, error = ?e, "Failed to remove a fired alert");
+    }
+}
+
+// eg. "@UserId(...) CHAT is above $0.05: it's $0.0512 now."
+fn fired(alert: &Alert, price: f64) -> String {
+    format!(
+        "@UserId({}) {} is {} {}: it's {} now.",
+        alert.user,
+        alert.symbol,
+        alert.direction.word(),
+        usd(alert.target),
+        usd(price)
+    )
+}
+
+// A price as ChartBot gives it, without zeros past the cents, eg. $0.05 rather than $0.05000, as
+// a target is usually a round number
+fn usd(price: f64) -> String {
+    let text = format::usd(price);
+    match text.split_once('.') {
+        Some((whole, decimals)) if decimals.len() > 2 => {
+            format!("{whole}.{:0<2}", decimals.trim_end_matches('0'))
+        }
+        _ => text,
+    }
+}
+
+// eg. "CHAT above $0.05"
+fn described(alert: &Alert) -> String {
+    format!(
+        "{} {} {}",
+        alert.symbol,
+        alert.direction.word(),
+        usd(alert.target)
+    )
+}
+
+/// `/alert CHAT above 0.05`
+struct SetAlert(Arc<BotState>);
+
+static SET_ALERT: LazyLock<BotCommandDefinition> = LazyLock::new(|| BotCommandDefinition {
+    name: "alert".to_string(),
+    description: Some(
+        "Tells you here when a token's price goes above or below one you give, eg. CHAT above 0.05"
+            .to_string(),
+    ),
+    placeholder: None,
+    // A single string parameter, so OpenChat passes everything typed after /alert
+    params: vec![BotCommandParam {
+        name: "alert".to_string(),
+        description: Some("A token, above or below, and a price in USD".to_string()),
+        placeholder: Some("CHAT above 0.05".to_string()),
+        required: true,
+        param_type: BotCommandParamType::StringParam(StringParam {
+            min_length: 1,
+            max_length: 100,
+            choices: Vec::new(),
+            multi_line: false,
+        }),
+    }],
+    permissions: BotPermissions::default(),
+    default_role: None,
+    direct_messages: Some(false),
+});
+
+#[async_trait]
+impl CommandHandler<AgentRuntime> for SetAlert {
+    fn definition(&self) -> &BotCommandDefinition {
+        &SET_ALERT
+    }
+
+    async fn execute(
+        &self,
+        oc_client: Client<AgentRuntime, BotCommandContext>,
+    ) -> Result<SuccessResult, String> {
+        let context = oc_client.context();
+        let text: String = context.command.maybe_arg("alert").unwrap_or_default();
+        let reply = match args::parse(&text) {
+            Ok(args) => self.set(context, args).await,
+            Err(text) => text,
+        };
+        privately(context, reply)
+    }
+}
+
+impl SetAlert {
+    // What to tell whoever set it
+    async fn set(&self, context: &BotCommandContext, args: AlertArgs) -> String {
+        let BotState {
+            prices,
+            market,
+            alerts,
+        } = &*self.0;
+        let Some(chat) = context.scope.chat().copied() else {
+            return "Alerts can only be set in a chat.".to_string();
+        };
+
+        let token = match prices.find(&args.symbol).await {
+            Ok(Some(token)) => token,
+            Ok(None) => return format!("Couldn't find {}.", args.symbol),
+            Err(error) => return reply(error),
+        };
+        let Some(price) = market.price(&token.source, now()) else {
+            return format!(
+                "I can't watch {}'s price: I follow OpenChat's tokens and the 250 largest coins.",
+                token.symbol
+            );
+        };
+        if args.direction.is_met(price, args.target) {
+            return format!(
+                "{} is already {} {}: it's {}.",
+                token.symbol,
+                args.direction.word(),
+                usd(args.target),
+                usd(price)
+            );
+        }
+
+        let alert = Alert {
+            id: 0,
+            user: context.command.initiator,
+            chat,
+            api_gateway: context.api_gateway,
+            symbol: token.symbol,
+            source: token.source,
+            direction: args.direction,
+            target: args.target,
+            set_at: now(),
+        };
+        match alerts.add(alert) {
+            Ok(Some(alert)) => format!(
+                "I'll tell you here when {} goes {} {}. It's {} now.",
+                alert.symbol,
+                alert.direction.word(),
+                usd(alert.target),
+                usd(price)
+            ),
+            Ok(None) => format!(
+                "You have {MAX_PER_USER_PER_CHAT} alerts in this chat, the most you can. Remove \
+                one with /remove_alert."
+            ),
+            Err(e) => internal("Failed to save an alert", e),
+        }
+    }
+}
+
+/// `/alerts`, which lists the user's alerts in the chat, numbered for `/remove_alert`
+struct ListAlerts(Arc<BotState>);
+
+static LIST_ALERTS: LazyLock<BotCommandDefinition> = LazyLock::new(|| BotCommandDefinition {
+    name: "alerts".to_string(),
+    description: Some("Lists your alerts in this chat".to_string()),
+    placeholder: None,
+    params: Vec::new(),
+    permissions: BotPermissions::default(),
+    default_role: None,
+    direct_messages: Some(false),
+});
+
+#[async_trait]
+impl CommandHandler<AgentRuntime> for ListAlerts {
+    fn definition(&self) -> &BotCommandDefinition {
+        &LIST_ALERTS
+    }
+
+    async fn execute(
+        &self,
+        oc_client: Client<AgentRuntime, BotCommandContext>,
+    ) -> Result<SuccessResult, String> {
+        let context = oc_client.context();
+        let BotState { market, alerts, .. } = &*self.0;
+        let mine = match context.scope.chat() {
+            Some(chat) => alerts.of(context.command.initiator, *chat),
+            None => Vec::new(),
+        };
+        let now = now();
+        privately(context, listed(&mine, |source| market.price(source, now)))
+    }
+}
+
+// eg. "1. CHAT above $0.05 (now $0.0295)", one a line
+fn listed(alerts: &[Alert], price: impl Fn(&Source) -> Option<f64>) -> String {
+    if alerts.is_empty() {
+        return "You have no alerts in this chat. Set one with /alert, eg. /alert CHAT above 0.05"
+            .to_string();
+    }
+    alerts
+        .iter()
+        .enumerate()
+        .map(|(i, alert)| match price(&alert.source) {
+            Some(price) => format!("{}. {} (now {})", i + 1, described(alert), usd(price)),
+            None => format!("{}. {}", i + 1, described(alert)),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `/remove_alert 2`, which removes the user's alert numbered 2 by `/alerts`
+struct RemoveAlert(Arc<BotState>);
+
+static REMOVE_ALERT: LazyLock<BotCommandDefinition> = LazyLock::new(|| BotCommandDefinition {
+    name: "remove_alert".to_string(),
+    description: Some(
+        "Removes one of your alerts in this chat, by its number in /alerts".to_string(),
+    ),
+    placeholder: None,
+    params: vec![BotCommandParam {
+        name: "number".to_string(),
+        description: Some("Its number in /alerts".to_string()),
+        placeholder: Some("1".to_string()),
+        required: true,
+        param_type: BotCommandParamType::IntegerParam(IntegerParam {
+            min_value: 1,
+            max_value: MAX_PER_USER_PER_CHAT as i64,
+            choices: Vec::new(),
+        }),
+    }],
+    permissions: BotPermissions::default(),
+    default_role: None,
+    direct_messages: Some(false),
+});
+
+#[async_trait]
+impl CommandHandler<AgentRuntime> for RemoveAlert {
+    fn definition(&self) -> &BotCommandDefinition {
+        &REMOVE_ALERT
+    }
+
+    async fn execute(
+        &self,
+        oc_client: Client<AgentRuntime, BotCommandContext>,
+    ) -> Result<SuccessResult, String> {
+        let context = oc_client.context();
+        let number: i64 = context.command.maybe_arg("number").unwrap_or_default();
+        let reply = match (context.scope.chat(), usize::try_from(number)) {
+            (Some(chat), Ok(n)) => {
+                match self
+                    .0
+                    .alerts
+                    .remove_nth(context.command.initiator, *chat, n)
+                {
+                    Ok(Some(alert)) => format!("Removed your alert for {}.", described(&alert)),
+                    Ok(None) => {
+                        format!("You have no alert {number} here. /alerts lists yours, numbered.")
+                    }
+                    Err(e) => internal("Failed to remove an alert", e),
+                }
+            }
+            _ => "/alerts lists yours, numbered.".to_string(),
+        };
+        privately(context, reply)
+    }
+}
+
+// A reply only whoever ran the command sees
+fn privately(context: &BotCommandContext, text: String) -> Result<SuccessResult, String> {
+    let Some(message_id) = context.message_id() else {
+        return Err(text);
+    };
+    Ok(
+        EphemeralMessageBuilder::new(MessageContentInitial::from_text(text), message_id)
+            .build()
+            .into(),
+    )
+}
+
+struct Notifications {
+    alerts: Arc<Alerts>,
+    oc_public_key: String,
+}
+
+// Drops a chat's alerts when the bot's uninstalled from it. Other notifications are acknowledged
+// and ignored. A notification that isn't OpenChat's is refused with a 4xx, which isn't retried,
+// and one the alerts can't be saved after with a 5xx, which is.
+async fn notify(
+    State(state): State<Arc<Notifications>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    let Some(signature) = headers.get("x-oc-signature").and_then(|v| v.to_str().ok()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let notification = match BotEventWrapper::parse(&body, signature, &state.oc_public_key) {
+        Ok(notification) => notification,
+        Err(error) => {
+            warn!(?error, "Refused a notification");
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+    if let BotEvent::Lifecycle(BotLifecycleEvent::Uninstalled(uninstalled)) = notification.event {
+        match state.alerts.remove_at(uninstalled.location) {
+            Ok(dropped) => info!(location = ?uninstalled.location, dropped, "Uninstalled"),
+            Err(e) => {
+                error!(error = ?e, "Failed to drop an uninstalled chat's alerts");
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
+        }
+    }
+    StatusCode::OK
+}
+
+fn reply(error: PriceError) -> String {
+    match error {
+        PriceError::RateLimited(source) => {
+            format!("{source} is getting too many requests. Please try again in a minute.")
+        }
+        PriceError::Other(e) => internal("Failed to find a token", e),
+    }
+}
+
+fn internal<E: std::fmt::Debug>(what: &str, e: E) -> String {
+    error!(error = ?e, "{what}");
+    SOMETHING_WENT_WRONG.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ic_agent::export::Principal;
+    use oc_bots_sdk::types::{CanisterId, Chat};
+    use store::Direction;
+
+    fn id(n: u8) -> CanisterId {
+        Principal::from_slice(&[n; 10]).into()
+    }
+
+    fn alert(symbol: &str, direction: Direction, target: f64) -> Alert {
+        Alert {
+            id: 1,
+            user: id(1),
+            chat: Chat::Group(id(2)),
+            api_gateway: id(3),
+            symbol: symbol.to_string(),
+            source: Source::CoinGecko(symbol.to_lowercase()),
+            direction,
+            target,
+            set_at: 0,
+        }
+    }
+
+    fn prices(source: &Source) -> Option<f64> {
+        match source {
+            Source::CoinGecko(id) if id == "chat" => Some(0.051),
+            Source::CoinGecko(id) if id == "icp" => Some(4.0),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn an_alert_is_met_once_its_price_reaches_the_target() {
+        let alerts = [
+            alert("CHAT", Direction::Above, 0.05),
+            alert("CHAT", Direction::Below, 0.05),
+            alert("ICP", Direction::Below, 4.0),
+            alert("ADA", Direction::Above, 0.0),
+        ];
+
+        let met: Vec<(String, f64)> = met(&alerts, prices)
+            .into_iter()
+            .map(|(a, price)| (described(&a), price))
+            .collect();
+
+        // ADA's price isn't known, so it isn't met, however low its target
+        assert_eq!(
+            met,
+            [
+                ("CHAT above $0.05".to_string(), 0.051),
+                ("ICP below $4.00".to_string(), 4.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fired_alert_mentions_whoever_set_it() {
+        let fired = fired(&alert("CHAT", Direction::Above, 0.05), 0.0512);
+
+        assert_eq!(
+            fired,
+            format!("@UserId({}) CHAT is above $0.05: it's $0.0512 now.", id(1))
+        );
+    }
+
+    #[test]
+    fn alerts_are_listed_numbered_with_their_prices_now() {
+        let alerts = [
+            alert("CHAT", Direction::Above, 0.05),
+            alert("ADA", Direction::Below, 0.2),
+        ];
+
+        assert_eq!(
+            listed(&alerts, prices),
+            "1. CHAT above $0.05 (now $0.051)\n2. ADA below $0.20"
+        );
+        assert!(listed(&[], prices).starts_with("You have no alerts"));
+    }
+
+    #[test]
+    fn prices_drop_the_zeros_past_the_cents() {
+        assert_eq!(usd(0.05), "$0.05");
+        assert_eq!(usd(0.0512), "$0.0512");
+        assert_eq!(usd(0.2), "$0.20");
+        assert_eq!(usd(0.002345), "$0.002345");
+        assert_eq!(usd(5.0), "$5.00");
+        assert_eq!(usd(67123.4), "$67,123");
+    }
+
+    #[test]
+    fn its_commands_need_no_permissions_and_it_posts_only_text() {
+        let definition = definition(vec![
+            SET_ALERT.clone(),
+            LIST_ALERTS.clone(),
+            REMOVE_ALERT.clone(),
+        ]);
+
+        for command in &definition.commands {
+            assert!(command.permissions.is_empty(), "/{}", command.name);
+        }
+        let autonomous = definition.autonomous_config.unwrap().permissions;
+        assert_eq!(
+            autonomous,
+            BotPermissions::default().with_message(&HashSet::from([MessagePermission::Text]))
+        );
+    }
+}
