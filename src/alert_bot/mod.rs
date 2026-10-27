@@ -1,6 +1,7 @@
 //! PriceAlertBot, which confirms `/alert CHAT above 0.05` in the chat, then replies to that
 //! confirmation when the token's price goes above or below the one given. Deleting the confirmation
-//! cancels the alert. `/alerts` lists someone's alerts in the chat, and `/remove_alert` removes one. Prices come from the same market as ChartBot's and the website's,
+//! cancels the alert. `/alerts` lists someone's alerts in the chat, and `/remove_alert` removes one,
+//! striking out its confirmation. Prices come from the same market as ChartBot's and the website's,
 //! and the alerts are checked each time it refreshes. See the README.
 
 use crate::bot;
@@ -25,8 +26,8 @@ use oc_bots_sdk::oc_api::actions::{ActionArgsBuilder, send_message};
 use oc_bots_sdk::oc_api::client::{Client, ClientFactory};
 use oc_bots_sdk::types::{
     ActionContext, ActionScope, AutonomousContext, BotCommandContext, BotPermissions, ChatEvent,
-    EventIndex, InstallationLocationType, MessageContent, MessageContentInitial, MessagePermission,
-    OCErrorCode, TimestampMillis,
+    EventIndex, InstallationLocationType, MessageContent, MessageContentInitial, MessageId,
+    MessagePermission, OCErrorCode, TimestampMillis, UnitResult,
 };
 use oc_bots_sdk_offchain::AgentRuntime;
 use std::collections::{HashMap, HashSet};
@@ -51,6 +52,7 @@ pub fn routes(
     oc_public_key: String,
 ) -> Router {
     let state = Arc::new(BotState {
+        client_factory: client_factory.clone(),
         prices,
         market,
         alerts: alerts.clone(),
@@ -69,9 +71,9 @@ pub fn routes(
 }
 
 /// PriceAlertBot's definition, which OpenChat reads from its endpoint. `/alert` sends text, to
-/// confirm an alert, and the bot sends text on its own, to post alerts as they fire. The other
-/// commands only reply privately, so need no permissions. It's for groups and channels: alerts by
-/// direct message are left for later.
+/// confirm an alert, and the bot sends text on its own, to post alerts as they fire and to strike
+/// out the confirmations of those removed. The other commands only reply privately, so need no
+/// permissions. It's for groups and channels: alerts by direct message are left for later.
 pub fn definition(commands: Vec<BotCommandDefinition>) -> BotDefinition {
     BotDefinition {
         description: "Replies here when a token's price goes above or below one you give. Try \
@@ -127,6 +129,7 @@ pub fn spawn_checker(
 }
 
 struct BotState {
+    client_factory: Arc<ClientFactory<AgentRuntime>>,
     prices: Arc<Prices>,
     market: Arc<Market>,
     alerts: Arc<Alerts>,
@@ -376,6 +379,7 @@ impl SetAlert {
             thread: context.scope.thread(),
             confirmation_id: context.message_id(),
             confirmation: None,
+            confirmation_text: None,
             post_id: store::new_message_id(),
             api_gateway: context.api_gateway,
             symbol: token.symbol,
@@ -401,7 +405,11 @@ where
     E: std::fmt::Debug,
     F: Future<Output = (Option<M>, Result<send_message::Response, E>)>,
 {
-    let alert = match alerts.add(alert) {
+    let text = confirmation(&alert, price);
+    let alert = match alerts.add(Alert {
+        confirmation_text: Some(text.clone()),
+        ..alert
+    }) {
         Ok(Some(alert)) => alert,
         Ok(None) => {
             return Err(format!(
@@ -412,7 +420,7 @@ where
         Err(e) => return Err(internal("Failed to save an alert", e)),
     };
 
-    let (message, response) = send(confirmation(&alert, price)).await;
+    let (message, response) = send(text).await;
     match (message, confirmed_at(response)) {
         (Some(message), Ok(confirmation)) => {
             alerts.confirmed(alert.id, confirmation);
@@ -575,7 +583,13 @@ impl CommandHandler<AgentRuntime> for RemoveAlert {
                     .alerts
                     .remove_nth(context.command.initiator, *chat, n)
                 {
-                    Some(alert) => format!("Removed your alert for {}.", described(&alert)),
+                    Some(alert) => {
+                        // In a task of its own, so that the reply needn't wait for it
+                        let client_factory = self.0.client_factory.clone();
+                        let reply = format!("Removed your alert for {}.", described(&alert));
+                        tokio::spawn(strike_out(client_factory, alert));
+                        reply
+                    }
                     None => {
                         format!("You have no alert {number} here. /alerts lists yours, numbered.")
                     }
@@ -585,6 +599,45 @@ impl CommandHandler<AgentRuntime> for RemoveAlert {
         };
         privately(context, reply)
     }
+}
+
+// Strikes out a removed alert's confirmation, so that the chat can see it's gone. The bot edits it
+// on its own, as OpenChat only lets a bot edit its messages that way.
+async fn strike_out(client_factory: Arc<ClientFactory<AgentRuntime>>, alert: Alert) {
+    let Some((message_id, text)) = struck_out(&alert) else {
+        return;
+    };
+    let response = client_factory
+        .build(AutonomousContext {
+            api_gateway: alert.api_gateway,
+            scope: ActionScope::Chat(alert.chat),
+        })
+        .edit_message(message_id, MessageContentInitial::from_text(text))
+        .in_thread(alert.thread)
+        .execute_async()
+        .await;
+    match response {
+        Ok(UnitResult::Success) => info!(id = alert.id, "Struck out a removed alert"),
+        response => warn!(
+            id = alert.id,
+            ?response,
+            "Failed to strike out a removed alert"
+        ),
+    }
+}
+
+// The removed alert's confirmation, and its text struck out, eg. "~~I'll reply here when CHAT goes
+// above $0.05. It's $0.0295 now.~~". One that wasn't posted, or was saved before its text was kept,
+// is left as it is.
+fn struck_out(alert: &Alert) -> Option<(MessageId, String)> {
+    let (Some(_), Some(message_id), Some(text)) = (
+        alert.confirmation,
+        alert.confirmation_id,
+        &alert.confirmation_text,
+    ) else {
+        return None;
+    };
+    Some((message_id, format!("~~{text}~~")))
 }
 
 // A reply only whoever ran the command sees
@@ -693,6 +746,7 @@ mod tests {
             thread: None,
             confirmation_id: None,
             confirmation: None,
+            confirmation_text: None,
             post_id: 1.into(),
             api_gateway: id(3),
             symbol: symbol.to_string(),
@@ -757,6 +811,33 @@ mod tests {
             fired(&alert, 0.0512),
             format!("@UserId({}) CHAT is above $0.05: it's $0.0512 now.", id(1))
         );
+    }
+
+    #[test]
+    fn a_removed_alerts_confirmation_is_struck_out_once_posted() {
+        let text = "I'll reply here when CHAT goes above $0.05. It's $0.0295 now.";
+        let confirmed = Alert {
+            confirmation_id: Some(70.into()),
+            confirmation: Some(7),
+            confirmation_text: Some(text.to_string()),
+            ..alert("CHAT", Direction::Above, 0.05)
+        };
+        assert_eq!(
+            struck_out(&confirmed),
+            Some((70.into(), format!("~~{text}~~")))
+        );
+
+        // Not while it's being posted, nor if its text wasn't kept
+        let posting = Alert {
+            confirmation: None,
+            ..confirmed.clone()
+        };
+        assert_eq!(struck_out(&posting), None);
+        let saved_before = Alert {
+            confirmation_text: None,
+            ..confirmed
+        };
+        assert_eq!(struck_out(&saved_before), None);
     }
 
     #[test]
@@ -970,6 +1051,7 @@ mod tests {
                 thread: None,
                 event_index: 7,
                 latest_event_index: 7,
+                tip: None,
             }),
             timestamp: 1000,
             notification_index: 1,
@@ -1021,6 +1103,10 @@ mod tests {
         let kept = alerts.checkable();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].confirmation, Some(1));
+        assert_eq!(
+            kept[0].confirmation_text.as_deref(),
+            Some("I'll reply here when CHAT goes above $0.05. It's $0.0295 now.")
+        );
 
         let rules = set((
             Some("confirmation"),

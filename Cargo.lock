@@ -1770,7 +1770,7 @@ dependencies = [
 [[package]]
 name = "oc_bots_sdk"
 version = "0.1.0"
-source = "git+https://github.com/open-chat-labs/open-chat-bots?branch=main#3e434d29b70a7c9800a8937c0fb8a264a23601d4"
+source = "git+https://github.com/open-chat-labs/open-chat-bots?branch=main#13ef5ba5a1a898583359b42bd19efdd9f2a59e92"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1796,7 +1796,7 @@ dependencies = [
 [[package]]
 name = "oc_bots_sdk_offchain"
 version = "0.1.0"
-source = "git+https://github.com/open-chat-labs/open-chat-bots?branch=main#3e434d29b70a7c9800a8937c0fb8a264a23601d4"
+source = "git+https://github.com/open-chat-labs/open-chat-bots?branch=main#13ef5ba5a1a898583359b42bd19efdd9f2a59e92"
 dependencies = [
  "futures",
  "http",
