@@ -274,7 +274,8 @@ managed through SSM.
 - **Its own distribution:** OpenChat reads a bot's definition from its endpoint's root, so ChartBot
   can't share a distribution with the bridges.
 - **Its url:** `https://d2r0806cxz8193.cloudfront.net`, the distribution `E2LYK4LO2EO26X`.
-- **PriceAlertBot** has a distribution of its own, which maps its root to the service's `/alerts`.
+- **PriceAlertBot** has a distribution of its own, which maps its root to the service's `/alerts`:
+  `https://d1dka25zgffloh.cloudfront.net`, the distribution `E1YB2RA3NUKRLO`.
 - **The alerts** are kept on the instance, in `/var/lib/oc-price-service`. They outlast restarts
   and deploys, but not replacing the instance, unless that directory's copied over.
 
