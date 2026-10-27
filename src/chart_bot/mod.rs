@@ -14,10 +14,24 @@ use std::sync::{Arc, LazyLock};
 use tracing::{error, warn};
 
 mod args;
-mod format;
+pub mod format;
 mod render;
 
 static DEFINITION: LazyLock<BotCommandDefinition> = LazyLock::new(Chart::definition);
+
+/// ChartBot's definition, which OpenChat reads from its endpoint
+pub fn definition(commands: Vec<BotCommandDefinition>) -> BotDefinition {
+    BotDefinition {
+        description:
+            "Charts the prices of crypto tokens. Try /chart CHAT, or /chart CHAT ICP ckBTC \
+            30d to compare several over 30 days."
+                .to_string(),
+        commands,
+        autonomous_config: None,
+        default_subscriptions: None,
+        restricted_locations: None,
+    }
+}
 
 const SOMETHING_WENT_WRONG: &str = "Something went wrong. Please try again.";
 

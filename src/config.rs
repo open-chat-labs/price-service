@@ -5,6 +5,7 @@ use oc_bots_sdk::mainnet::{
 use oc_bots_sdk::types::CanisterId;
 use std::collections::HashMap;
 use std::env;
+use std::path::PathBuf;
 
 /// From environment variables
 pub struct Config {
@@ -20,15 +21,19 @@ pub struct Config {
     /// Local ledgers to serve mainnet ledgers' prices for, so a local OpenChat shows real prices
     pub ledger_aliases: HashMap<CanisterId, CanisterId>,
     pub port: u16,
+    /// PriceAlertBot's identity, as PEM text. Without one, PriceAlertBot is off.
+    pub alert_bot_identity_pem: Option<String>,
+    /// Where PriceAlertBot keeps its alerts, so they outlast restarts
+    pub alerts_file: PathBuf,
+    /// A port to serve PriceAlertBot on as well, at its root, eg. locally, where it needs an origin
+    /// of its own to be registered
+    pub alert_bot_port: Option<u16>,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let identity_pem = match (var("OC_IDENTITY_PEM"), var("OC_IDENTITY_PEM_FILE")) {
-            (Some(pem), _) => pem,
-            (None, Some(file)) => std::fs::read_to_string(&file)
-                .with_context(|| format!("Failed to read OC_IDENTITY_PEM_FILE {file}"))?,
-            (None, None) => bail!("Set OC_IDENTITY_PEM or OC_IDENTITY_PEM_FILE"),
+        let Some(identity_pem) = pem("OC_IDENTITY_PEM", "OC_IDENTITY_PEM_FILE")? else {
+            bail!("Set OC_IDENTITY_PEM or OC_IDENTITY_PEM_FILE");
         };
         let storage_index = match var("OC_STORAGE_INDEX") {
             Some(text) => canister_id(&text)?,
@@ -49,7 +54,26 @@ impl Config {
             port: var("PORT")
                 .map_or(Ok(3000), |p| p.parse())
                 .context("Invalid PORT")?,
+            alert_bot_identity_pem: pem("ALERT_BOT_IDENTITY_PEM", "ALERT_BOT_IDENTITY_PEM_FILE")?,
+            alerts_file: var("ALERTS_FILE")
+                .unwrap_or_else(|| "price-alerts.json".to_string())
+                .into(),
+            alert_bot_port: var("ALERT_BOT_PORT")
+                .map(|p| p.parse())
+                .transpose()
+                .context("Invalid ALERT_BOT_PORT")?,
         })
+    }
+}
+
+// A PEM given as text, or in a file. An empty file is none, so the host can always mount one.
+fn pem(text_var: &str, file_var: &str) -> Result<Option<String>> {
+    match (var(text_var), var(file_var)) {
+        (Some(pem), _) => Ok(Some(pem)),
+        (None, Some(file)) => std::fs::read_to_string(&file)
+            .map(|pem| Some(pem).filter(|pem| !pem.trim().is_empty()))
+            .with_context(|| format!("Failed to read {file_var} {file}")),
+        (None, None) => Ok(None),
     }
 }
 

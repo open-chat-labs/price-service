@@ -74,7 +74,7 @@ fn decimals_for_step(step: f64) -> usize {
     (decimals + extra).clamp(0, 12) as usize
 }
 
-fn thousands(value: u64) -> String {
+pub fn thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut result = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {

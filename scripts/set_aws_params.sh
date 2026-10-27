@@ -4,7 +4,9 @@
 #
 #   ./scripts/set_aws_params.sh [public url]
 #
-# - The bot's identity comes from dfx: the identity IDENTITY names, chart_bot by default.
+# - The bots' identities come from dfx: ChartBot's is the identity IDENTITY names, chart_bot by
+#   default, and PriceAlertBot's ALERT_IDENTITY's, price_alert_bot by default. PriceAlertBot's is
+#   left out if there's no such identity, which leaves PriceAlertBot off.
 # - It asks for the CoinGecko Demo key. Leave it blank to keep the one already set.
 # - The public url is the CloudFront distribution's, which the deploy checks. Leave it out until the
 #   distribution exists, then run this again with it.
@@ -17,6 +19,7 @@ ACCOUNT=253040722768
 REGION=us-east-1
 PREFIX=/oc-price-service
 IDENTITY=${IDENTITY:-chart_bot}
+ALERT_IDENTITY=${ALERT_IDENTITY:-price_alert_bot}
 PUBLIC_URL=${1:-}
 
 account=$(aws sts get-caller-identity --query Account --output text)
@@ -41,7 +44,15 @@ put() {
 
 dfx identity export "$IDENTITY" > "$tmp"
 put OC_IDENTITY_PEM SecureString
-echo "The bot's principal, to register it with: $(dfx identity get-principal --identity "$IDENTITY")"
+echo "ChartBot's principal, to register it with: $(dfx identity get-principal --identity "$IDENTITY")"
+
+if dfx identity get-principal --identity "$ALERT_IDENTITY" > /dev/null 2>&1; then
+    dfx identity export "$ALERT_IDENTITY" > "$tmp"
+    put ALERT_BOT_IDENTITY_PEM SecureString
+    echo "PriceAlertBot's principal, to register it with: $(dfx identity get-principal --identity "$ALERT_IDENTITY")"
+else
+    echo "No dfx identity $ALERT_IDENTITY, so PriceAlertBot's is left as it is."
+fi
 
 read -rsp "CoinGecko Demo API key, or blank to keep the one already set: " key
 echo

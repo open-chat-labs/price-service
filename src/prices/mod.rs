@@ -6,6 +6,7 @@ pub use coingecko::CoinMarket;
 use market::History;
 use oc_bots_sdk::types::{CanisterId, TimestampMillis};
 pub use registry::ListedToken;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -44,7 +45,7 @@ pub struct Token {
 }
 
 /// Where a token's prices come from
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Source {
     /// A token on the Internet Computer, by its ledger
     Icp(CanisterId),

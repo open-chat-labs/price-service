@@ -1,34 +1,29 @@
-//! Token prices for OpenChat, kept in memory. It serves the prices the website shows, and ChartBot,
-//! which replies to `/chart` with a price chart of one or more crypto tokens. See the README.
+//! Token prices for OpenChat, kept in memory. It serves the prices the website shows, ChartBot,
+//! which replies to `/chart` with a price chart of one or more crypto tokens, and PriceAlertBot,
+//! which tells someone when a token's price goes above or below one they gave. See the README.
 
+use crate::alert_bot::Alerts;
+use crate::bot::BotIdentity;
 use crate::chart_bot::Chart;
 use crate::config::Config;
 use crate::prices::{CoinGecko, IcpSwap, Market, Prices};
-use anyhow::{Result, anyhow, bail};
-use axum::body::Bytes;
-use axum::extract::State;
+use anyhow::Result;
+use axum::Router;
+use axum::http::HeaderValue;
 use axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
-use axum::http::{HeaderValue, StatusCode};
-use axum::response::Json;
-use axum::routing::{get, post};
-use axum::{Extension, Router};
-use ic_agent::identity::{BasicIdentity, Secp256k1Identity};
-use ic_agent::{Agent, Identity};
-use oc_bots_sdk::api::command::{CommandHandlerRegistry, CommandResponse};
-use oc_bots_sdk::api::definition::BotDefinition;
+use ic_agent::Agent;
+use oc_bots_sdk::api::command::CommandHandlerRegistry;
 use oc_bots_sdk::mainnet::mainnet_ic_url;
-use oc_bots_sdk::oc_api::client::ClientFactory;
-use oc_bots_sdk_offchain::middleware::tower::{ExtractJwtLayer, OpenChatJwt};
-use oc_bots_sdk_offchain::{AgentRuntime, env};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
-use tracing::info;
+use tracing::{error, info};
 
+mod alert_bot;
 mod api;
+mod bot;
 mod chart_bot;
 mod config;
 mod prices;
@@ -42,14 +37,8 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::from_env()?;
-    let identity = identity_from_pem(&config.identity_pem)?;
-    info!(principal = %identity.sender().map_err(|e| anyhow!(e))?, "Price service starting");
-
-    let agent = build_agent(config.ic_url, identity).await?;
-    let oc_client_factory = Arc::new(ClientFactory::new(AgentRuntime::new(
-        agent,
-        tokio::runtime::Runtime::new()?,
-    )));
+    let chart_bot = BotIdentity::new(&config.identity_pem, config.ic_url.clone()).await?;
+    info!(principal = %chart_bot.principal, "Price service starting");
 
     // Prices are mainnet's, whichever OpenChat the bot runs against, so OpenChat's tokens are read
     // from mainnet's Registry, anonymously
@@ -61,29 +50,64 @@ async fn main() -> Result<()> {
     prices::spawn_refresh(market.clone(), icpswap.clone(), coingecko.clone(), mainnet);
 
     let prices = Arc::new(Prices::new(market.clone(), coingecko, icpswap));
-    let commands = CommandHandlerRegistry::new(oc_client_factory)
-        .register(Chart::new(prices, config.storage_index));
+    let chart_commands = CommandHandlerRegistry::new(chart_bot.client_factory)
+        .register(Chart::new(prices.clone(), config.storage_index));
+    let chart_routes = bot::routes(
+        chart_bot::definition(chart_commands.definitions()),
+        config.oc_public_key.clone(),
+        chart_commands,
+    );
 
-    let app_state = AppState {
-        oc_public_key: config.oc_public_key,
-        commands,
-    };
+    // PriceAlertBot, given an identity of its own
+    let mut alert_routes = None;
+    if let Some(pem) = &config.alert_bot_identity_pem {
+        let alert_bot = BotIdentity::new(pem, config.ic_url.clone()).await?;
+        info!(principal = %alert_bot.principal, "PriceAlertBot starting");
+        // Without its alerts it's left off, rather than stopping the prices and ChartBot too
+        match Alerts::load(Some(config.alerts_file.clone())) {
+            Ok(alerts) => {
+                let alerts = Arc::new(alerts);
+                alert_bot::spawn_checker(
+                    alert_bot.client_factory.clone(),
+                    market.clone(),
+                    alerts.clone(),
+                );
+                alert_routes = Some(alert_bot::routes(
+                    alert_bot.client_factory,
+                    prices,
+                    market.clone(),
+                    alerts,
+                    config.oc_public_key.clone(),
+                ));
+            }
+            Err(e) => error!(error = ?e, "Failed to load the alerts, so PriceAlertBot is off"),
+        }
+    }
+    // Locally, its own origin is a port of its own
+    if let (Some(alert_routes), Some(port)) = (&alert_routes, config.alert_bot_port) {
+        let listener = listen(port).await?;
+        info!(port, "PriceAlertBot ready on its own port");
+        tokio::spawn(axum::serve(listener, with_layers(alert_routes.clone())).into_future());
+    }
 
-    let bot = Router::new()
-        .route("/execute_command", post(execute_command))
-        .route_layer(ExtractJwtLayer::new())
-        // OpenChat reads the bot's definition from its endpoint
-        .route("/", get(bot_definition))
-        .route("/bot_definition", get(bot_definition))
-        .with_state(Arc::new(app_state));
-    let routes = with_layers(bot.merge(api::router(market)));
-
-    let listener =
-        tokio::net::TcpListener::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), config.port))
-            .await?;
+    let listener = listen(config.port).await?;
     info!(port = config.port, "Price service ready");
-    axum::serve(listener, routes).await?;
+    axum::serve(listener, app(chart_routes, alert_routes, market)).await?;
     Ok(())
+}
+
+// ChartBot at the root, with the prices under /v1, and PriceAlertBot under /alerts, which its own
+// endpoint, a host of its own, maps to, as OpenChat only registers a bot at an origin
+fn app(chart_bot: Router, alert_bot: Option<Router>, market: Arc<Market>) -> Router {
+    let mut routes = chart_bot.merge(api::router(market));
+    if let Some(alert_bot) = alert_bot {
+        routes = routes.nest("/alerts", alert_bot);
+    }
+    with_layers(routes)
+}
+
+async fn listen(port: u16) -> Result<tokio::net::TcpListener> {
+    Ok(tokio::net::TcpListener::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port)).await?)
 }
 
 // What every response gets. The website calls the service from the browser, for both the bot and
@@ -99,83 +123,15 @@ fn with_layers(routes: Router) -> Router {
         ))
 }
 
-async fn execute_command(
-    State(state): State<Arc<AppState>>,
-    Extension(OpenChatJwt(jwt)): Extension<OpenChatJwt>,
-) -> (StatusCode, Bytes) {
-    match state
-        .commands
-        .execute(&jwt, &state.oc_public_key, env::now())
-        .await
-    {
-        CommandResponse::Success(r) => {
-            (StatusCode::OK, Bytes::from(serde_json::to_vec(&r).unwrap()))
-        }
-        CommandResponse::BadRequest(r) => (
-            StatusCode::BAD_REQUEST,
-            Bytes::from(serde_json::to_vec(&r).unwrap()),
-        ),
-        CommandResponse::InternalError(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Bytes::from(serde_json::to_vec(&err).unwrap()),
-        ),
-        CommandResponse::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, Bytes::new()),
-    }
-}
-
-async fn bot_definition(State(state): State<Arc<AppState>>, _body: String) -> Json<BotDefinition> {
-    Json(BotDefinition {
-        description:
-            "Charts the prices of crypto tokens. Try /chart CHAT, or /chart CHAT ICP ckBTC \
-            30d to compare several over 30 days."
-                .to_string(),
-        commands: state.commands.definitions(),
-        autonomous_config: None,
-        default_subscriptions: None,
-        restricted_locations: None,
-    })
-}
-
-struct AppState {
-    oc_public_key: String,
-    commands: CommandHandlerRegistry<AgentRuntime>,
-}
-
-async fn build_agent(ic_url: String, identity: Box<dyn Identity>) -> Result<Agent> {
-    let is_mainnet = ["ic0.app", "icp0.io", "icp-api.io"]
-        .iter()
-        .any(|host| ic_url.contains(host));
-
-    let agent = Agent::builder()
-        .with_url(ic_url)
-        .with_boxed_identity(identity)
-        .with_ingress_expiry(Duration::from_secs(60))
-        .build()?;
-
-    // Mainnet's root key is built into the agent
-    if !is_mainnet {
-        agent.fetch_root_key().await?;
-    }
-    Ok(agent)
-}
-
-fn identity_from_pem(pem: &str) -> Result<Box<dyn Identity>> {
-    if let Ok(identity) = Secp256k1Identity::from_pem(pem.as_bytes()) {
-        Ok(Box::new(identity))
-    } else if let Ok(identity) = BasicIdentity::from_pem(pem.as_bytes()) {
-        Ok(Box::new(identity))
-    } else {
-        bail!("The bot's PEM is neither a secp256k1 nor an Ed25519 key")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::prices::{CoinMarket, ListedToken, PricePoint, TokenPrice, now};
     use axum::body::{Body, to_bytes};
-    use axum::http::{Request, Response, header};
+    use axum::http::{Request, Response, StatusCode, header};
     use ic_agent::export::Principal;
+    use oc_bots_sdk::oc_api::client::ClientFactory;
+    use oc_bots_sdk_offchain::AgentRuntime;
     use std::collections::HashMap;
     use tower::ServiceExt;
 
@@ -447,5 +403,68 @@ mod tests {
             .iter()
             .collect();
         assert_eq!(origins, ["*"]);
+    }
+    // Built and dropped outside the requests' runtime, as the bot's client has a runtime of its own
+    #[test]
+    fn price_alert_bot_is_served_under_alerts_beside_the_prices() {
+        let agent = Agent::builder()
+            .with_url("http://127.0.0.1:1")
+            .build()
+            .unwrap();
+        let client_factory = Arc::new(ClientFactory::new(AgentRuntime::new(
+            agent,
+            tokio::runtime::Runtime::new().unwrap(),
+        )));
+        let market = market();
+        let http = prices::http_client().unwrap();
+        let prices = Arc::new(Prices::new(
+            market.clone(),
+            Arc::new(CoinGecko::new(http.clone(), None)),
+            Arc::new(IcpSwap::new(http)),
+        ));
+        let alert_bot = alert_bot::routes(
+            client_factory,
+            prices,
+            market.clone(),
+            Arc::new(Alerts::load(None).unwrap()),
+            "OpenChat's key".to_string(),
+        );
+        let app = app(Router::new(), Some(alert_bot), market);
+        let send = |request: Request<Body>| {
+            let app = app.clone();
+            async move { app.oneshot(request).await.unwrap() }
+        };
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let response = send(
+                Request::get("/alerts/bot_definition")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let definition = json(response).await;
+            assert!(
+                definition["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("/alert CHAT above 0.05")
+            );
+
+            // Notifications are signed by OpenChat rather than sent with a JWT, so they reach the
+            // bot, which refuses a bad signature, where a command without a JWT is a 401
+            let notification = Request::post("/alerts/notify")
+                .header("x-oc-signature", "bad")
+                .body(Body::from("{}"))
+                .unwrap();
+            assert_eq!(send(notification).await.status(), StatusCode::BAD_REQUEST);
+            let command = Request::post("/alerts/execute_command")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(send(command).await.status(), StatusCode::UNAUTHORIZED);
+
+            let prices = send(Request::get("/v1/prices").body(Body::empty()).unwrap()).await;
+            assert_eq!(prices.status(), StatusCode::OK);
+        });
     }
 }

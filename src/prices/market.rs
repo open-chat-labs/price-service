@@ -1,11 +1,12 @@
 use super::coingecko::CoinMarket;
 use super::icpswap::TokenPrice;
 use super::registry::ListedToken;
-use super::{Period, PricePoint, outliers, within_period};
+use super::{Period, PricePoint, Source, outliers, within_period};
 use ic_agent::export::Principal;
 use oc_bots_sdk::types::{CanisterId, TimestampMillis};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
+use tokio::sync::watch;
 
 const MINUTE: u64 = 60 * 1000;
 const HOUR: u64 = 60 * MINUTE;
@@ -42,6 +43,8 @@ pub struct Market {
     stablecoins: HashSet<CanisterId>,
     // Local ledgers standing in for mainnet ones, so a local OpenChat sees mainnet's prices
     aliases: HashMap<CanisterId, CanisterId>,
+    // When the latest prices or the coins were last refreshed, for whoever waits on that
+    refreshed: watch::Sender<TimestampMillis>,
 }
 
 /// The tokens OpenChat lists, from its Registry
@@ -112,6 +115,21 @@ impl Market {
                 .map(|text| Principal::from_text(text).unwrap().into())
                 .collect(),
             aliases,
+            refreshed: watch::channel(0).0,
+        }
+    }
+
+    /// Changes each time the latest prices or the coins are refreshed
+    pub fn refreshed(&self) -> watch::Receiver<TimestampMillis> {
+        self.refreshed.subscribe()
+    }
+
+    /// The latest price, in USD, of a token OpenChat lists or one of the largest coins. None if it
+    /// isn't kept, eg. a smaller coin, or it's stale or hasn't loaded yet.
+    pub fn price(&self, source: &Source, now: TimestampMillis) -> Option<f64> {
+        match source {
+            Source::Icp(ledger) => self.latest(now)?.prices.get(ledger).copied(),
+            Source::CoinGecko(id) => self.coins(now)?.by_id.get(id).map(|coin| coin.usd),
         }
     }
 
@@ -185,6 +203,7 @@ impl Market {
             prices: latest,
             by_liquidity,
         }));
+        self.refreshed.send_replace(now);
     }
 
     pub fn is_pinned(&self, ledger: CanisterId) -> bool {
@@ -289,6 +308,7 @@ impl Market {
             by_symbol,
             by_id,
         }));
+        self.refreshed.send_replace(now);
     }
 
     /// The coin's prices over the period, ending with its latest price. Only goes back a week.
@@ -461,6 +481,31 @@ mod tests {
             latest.prices,
             HashMap::from([(chat(), 0.028), (icp(), 2.58), (ckusdc(), 1.0)])
         );
+    }
+
+    #[test]
+    fn a_tokens_or_coins_price_is_its_latest_and_each_refresh_is_signalled() {
+        let market = market();
+        let mut refreshed = market.refreshed();
+        assert!(!refreshed.has_changed().unwrap());
+
+        market.set_latest(vec![price(chat(), 0.028, 1.0)], NOW);
+        assert!(refreshed.has_changed().unwrap());
+        refreshed.mark_unchanged();
+        market.set_coins(vec![coin_market("cardano", "ADA", 0.2, vec![0.2])], NOW);
+        assert!(refreshed.has_changed().unwrap());
+
+        assert_eq!(market.price(&Source::Icp(chat()), NOW), Some(0.028));
+        assert_eq!(market.price(&Source::Icp(icp()), NOW), None);
+        assert_eq!(
+            market.price(&Source::CoinGecko("cardano".to_string()), NOW),
+            Some(0.2)
+        );
+        assert_eq!(
+            market.price(&Source::CoinGecko("polkadot".to_string()), NOW),
+            None
+        );
+        assert_eq!(market.price(&Source::Icp(chat()), NOW + HOUR + 1), None);
     }
 
     #[test]
