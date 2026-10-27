@@ -5,7 +5,7 @@
 
 use crate::bot;
 use crate::chart_bot::format;
-use crate::prices::{Market, PriceError, Prices, Source, now};
+use crate::prices::{Market, PriceError, Prices, Source, Token, now};
 use args::AlertArgs;
 use async_trait::async_trait;
 use axum::Router;
@@ -25,10 +25,11 @@ use oc_bots_sdk::oc_api::actions::{ActionArgsBuilder, send_message};
 use oc_bots_sdk::oc_api::client::{Client, ClientFactory};
 use oc_bots_sdk::types::{
     ActionContext, ActionScope, AutonomousContext, BotCommandContext, BotPermissions,
-    InstallationLocationType, MessageContentInitial, MessagePermission,
+    InstallationLocationType, MessageContentInitial, MessagePermission, OCErrorCode,
+    TimestampMillis,
 };
 use oc_bots_sdk_offchain::AgentRuntime;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 use store::{Alert, MAX_PER_USER_PER_CHAT};
 use tracing::{error, info, warn};
@@ -88,6 +89,11 @@ pub fn definition(commands: Vec<BotCommandDefinition>) -> BotDefinition {
     }
 }
 
+/// How long an alert OpenChat can't post is tried again, at each refresh, eg. while its chat's
+/// canister is upgraded. After that, the chat's taken to be gone, as deleting a group doesn't tell
+/// its bots.
+const GIVE_UP_AFTER: TimestampMillis = 24 * 60 * 60 * 1000;
+
 /// Checks the alerts each time the market's prices refresh, posting each that's met in its chat,
 /// then removing it, so that it fires once
 pub fn spawn_checker(
@@ -97,10 +103,18 @@ pub fn spawn_checker(
 ) {
     let mut refreshed = market.refreshed();
     tokio::spawn(async move {
+        // When each alert OpenChat couldn't post was first tried
+        let mut failing_since = HashMap::new();
         while refreshed.changed().await.is_ok() {
             let now = now();
-            for (alert, price) in met(&alerts.all(), |source| market.price(source, now)) {
-                fire(&client_factory, &alerts, &alert, price).await;
+            let met = met(&alerts.all(), |source| market.price(source, now));
+            // An alert no longer met, or removed, starts afresh if it fails again
+            failing_since.retain(|id, _| met.iter().any(|(alert, _)| alert.id == *id));
+            for (alert, price) in met {
+                let posted = post_alert(&client_factory, &alert, price).await;
+                if is_done(&alert, posted, &mut failing_since, now) {
+                    alerts.remove(alert.id);
+                }
             }
         }
     });
@@ -126,38 +140,71 @@ fn met(alerts: &[Alert], price: impl Fn(&Source) -> Option<f64>) -> Vec<(Alert, 
         .collect()
 }
 
-// Posts the alert in its chat, mentioning who set it. It's removed once posted, or if OpenChat
-// refuses it, eg. as the bot was removed from the chat, so that it isn't tried again every minute.
-// It's kept, to be tried again, only if OpenChat couldn't be reached.
-async fn fire(
+#[derive(Debug, PartialEq)]
+enum Posted {
+    Yes,
+    /// eg. as the bot can no longer post in the chat, so trying again would fail too
+    Refused,
+    /// OpenChat, or the chat's canister, couldn't be reached
+    Failed,
+}
+
+// Posts the alert in its chat, and its thread if it was set in one, mentioning who set it
+async fn post_alert(
     client_factory: &ClientFactory<AgentRuntime>,
-    alerts: &Alerts,
     alert: &Alert,
     price: f64,
-) {
+) -> Posted {
     let client = client_factory.build(AutonomousContext {
         api_gateway: alert.api_gateway,
         scope: ActionScope::Chat(alert.chat),
     });
     let response = client
         .send_message(MessageContentInitial::from_text(fired(alert, price)))
+        .in_thread(alert.thread)
         .execute_async()
         .await;
+    let posted = posted(&response);
+    match posted {
+        Posted::Yes => info!(id = alert.id, symbol = alert.symbol, "Posted an alert"),
+        Posted::Refused => {
+            warn!(id = alert.id, chat = ?alert.chat, ?response, "OpenChat refused an alert")
+        }
+        Posted::Failed => warn!(id = alert.id, ?response, "Failed to post an alert"),
+    }
+    posted
+}
+
+// OpenChat answers C2CError when it couldn't reach the chat's canister, eg. as it was being upgraded
+fn posted<E>(response: &Result<send_message::Response, E>) -> Posted {
     match response {
-        Ok(send_message::Response::Success(_)) => {
-            info!(id = alert.id, symbol = alert.symbol, "Posted an alert")
+        Ok(send_message::Response::Success(_)) => Posted::Yes,
+        Ok(send_message::Response::Error(e)) if !e.matches_code(OCErrorCode::C2CError) => {
+            Posted::Refused
         }
-        Ok(send_message::Response::Error(e)) => {
-            warn!(id = alert.id, chat = ?alert.chat, error = ?e, "OpenChat refused an alert, so it's dropped")
-        }
-        Err(e) => {
-            warn!(id = alert.id, error = ?e, "Failed to post an alert, so it'll be tried again");
-            return;
-        }
+        _ => Posted::Failed,
     }
-    if let Err(e) = alerts.remove(alert.id) {
-        error!(id = alert.id, error = ?e, "Failed to remove a fired alert");
+}
+
+// Whether the alert's done with, so it's removed: once it's posted, or refused, so that it isn't
+// tried every minute, or once it's failed for a day. Until then it's tried again at each refresh.
+fn is_done(
+    alert: &Alert,
+    posted: Posted,
+    failing_since: &mut HashMap<u64, TimestampMillis>,
+    now: TimestampMillis,
+) -> bool {
+    if posted != Posted::Failed {
+        failing_since.remove(&alert.id);
+        return true;
     }
+    let since = *failing_since.entry(alert.id).or_insert(now);
+    if now.saturating_sub(since) < GIVE_UP_AFTER {
+        return false;
+    }
+    warn!(id = alert.id, chat = ?alert.chat, "Gave up on posting an alert");
+    failing_since.remove(&alert.id);
+    true
 }
 
 // eg. "@UserId(...) CHAT is above $0.05: it's $0.0512 now."
@@ -167,9 +214,20 @@ fn fired(alert: &Alert, price: f64) -> String {
         alert.user,
         alert.symbol,
         alert.direction.word(),
-        usd(alert.target),
+        target_usd(alert.target),
         usd(price)
     )
+}
+
+// A target as it was given, eg. $4.555 rather than ChartBot's $4.56, with the cents at least, eg.
+// $5.00. Rounding it could say a price was above $0.03 when it was above $0.029995.
+fn target_usd(target: f64) -> String {
+    let text = target.to_string();
+    let (whole, decimals) = text.split_once('.').unwrap_or((&text, ""));
+    let whole = whole
+        .parse::<u64>()
+        .map_or_else(|_| whole.to_string(), format::thousands);
+    format!("${whole}.{decimals:0<2}")
 }
 
 // A price as ChartBot gives it, without zeros past the cents, eg. $0.05 rather than $0.05000, as
@@ -190,7 +248,7 @@ fn described(alert: &Alert) -> String {
         "{} {} {}",
         alert.symbol,
         alert.direction.word(),
-        usd(alert.target)
+        target_usd(alert.target)
     )
 }
 
@@ -259,18 +317,16 @@ impl SetAlert {
             Ok(None) => return format!("Couldn't find {}.", args.symbol),
             Err(error) => return reply(error),
         };
-        let Some(price) = market.price(&token.source, now()) else {
-            return format!(
-                "I can't watch {}'s price: I follow OpenChat's tokens and the 250 largest coins.",
-                token.symbol
-            );
+        let price = match price_now(&token, market, now()) {
+            Ok(price) => price,
+            Err(reply) => return reply,
         };
         if args.direction.is_met(price, args.target) {
             return format!(
                 "{} is already {} {}: it's {}.",
                 token.symbol,
                 args.direction.word(),
-                usd(args.target),
+                target_usd(args.target),
                 usd(price)
             );
         }
@@ -279,6 +335,7 @@ impl SetAlert {
             id: 0,
             user: context.command.initiator,
             chat,
+            thread: context.scope.thread(),
             api_gateway: context.api_gateway,
             symbol: token.symbol,
             source: token.source,
@@ -291,7 +348,7 @@ impl SetAlert {
                 "I'll tell you here when {} goes {} {}. It's {} now.",
                 alert.symbol,
                 alert.direction.word(),
-                usd(alert.target),
+                target_usd(alert.target),
                 usd(price)
             ),
             Ok(None) => format!(
@@ -301,6 +358,27 @@ impl SetAlert {
             Err(e) => internal("Failed to save an alert", e),
         }
     }
+}
+
+// The token's price, which the alert's checked against at each refresh, or why there's none
+fn price_now(token: &Token, market: &Market, now: TimestampMillis) -> Result<f64, String> {
+    if let Some(price) = market.price(&token.source, now) {
+        return Ok(price);
+    }
+    let loaded = match token.source {
+        Source::Icp(_) => market.latest(now).is_some(),
+        Source::CoinGecko(_) => market.coins(now).is_some(),
+    };
+    Err(match (loaded, &token.source) {
+        (false, _) => {
+            "I don't have prices right now. Please try again in a few minutes.".to_string()
+        }
+        (true, Source::Icp(_)) => format!("There's no price for {} to watch.", token.symbol),
+        (true, Source::CoinGecko(_)) => format!(
+            "I can't watch {}'s price: I follow OpenChat's tokens and the 250 largest coins.",
+            token.symbol
+        ),
+    })
 }
 
 /// `/alerts`, which lists the user's alerts in the chat, numbered for `/remove_alert`
@@ -337,7 +415,8 @@ impl CommandHandler<AgentRuntime> for ListAlerts {
     }
 }
 
-// eg. "1. CHAT above $0.05 (now $0.0295)", one a line
+// eg. "1. CHAT above $0.05 (now $0.0295)", one a line. An alert whose price can't be had, eg. as
+// its coin has left the 250 largest, isn't checked until it can.
 fn listed(alerts: &[Alert], price: impl Fn(&Source) -> Option<f64>) -> String {
     if alerts.is_empty() {
         return "You have no alerts in this chat. Set one with /alert, eg. /alert CHAT above 0.05"
@@ -348,7 +427,7 @@ fn listed(alerts: &[Alert], price: impl Fn(&Source) -> Option<f64>) -> String {
         .enumerate()
         .map(|(i, alert)| match price(&alert.source) {
             Some(price) => format!("{}. {} (now {})", i + 1, described(alert), usd(price)),
-            None => format!("{}. {}", i + 1, described(alert)),
+            None => format!("{}. {} (no price now)", i + 1, described(alert)),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -398,11 +477,10 @@ impl CommandHandler<AgentRuntime> for RemoveAlert {
                     .alerts
                     .remove_nth(context.command.initiator, *chat, n)
                 {
-                    Ok(Some(alert)) => format!("Removed your alert for {}.", described(&alert)),
-                    Ok(None) => {
+                    Some(alert) => format!("Removed your alert for {}.", described(&alert)),
+                    None => {
                         format!("You have no alert {number} here. /alerts lists yours, numbered.")
                     }
-                    Err(e) => internal("Failed to remove an alert", e),
                 }
             }
             _ => "/alerts lists yours, numbered.".to_string(),
@@ -428,9 +506,7 @@ struct Notifications {
     oc_public_key: String,
 }
 
-// Drops a chat's alerts when the bot's uninstalled from it. Other notifications are acknowledged
-// and ignored. A notification that isn't OpenChat's is refused with a 4xx, which isn't retried,
-// and one the alerts can't be saved after with a 5xx, which is.
+// A notification that isn't OpenChat's is refused with a 4xx, which isn't retried
 async fn notify(
     State(state): State<Arc<Notifications>>,
     headers: HeaderMap,
@@ -439,23 +515,30 @@ async fn notify(
     let Some(signature) = headers.get("x-oc-signature").and_then(|v| v.to_str().ok()) else {
         return StatusCode::BAD_REQUEST;
     };
-    let notification = match BotEventWrapper::parse(&body, signature, &state.oc_public_key) {
-        Ok(notification) => notification,
+    match BotEventWrapper::parse(&body, signature, &state.oc_public_key) {
+        Ok(notification) => {
+            notified(&state.alerts, notification);
+            StatusCode::OK
+        }
         Err(error) => {
             warn!(?error, "Refused a notification");
-            return StatusCode::BAD_REQUEST;
-        }
-    };
-    if let BotEvent::Lifecycle(BotLifecycleEvent::Uninstalled(uninstalled)) = notification.event {
-        match state.alerts.remove_at(uninstalled.location) {
-            Ok(dropped) => info!(location = ?uninstalled.location, dropped, "Uninstalled"),
-            Err(e) => {
-                error!(error = ?e, "Failed to drop an uninstalled chat's alerts");
-                return StatusCode::INTERNAL_SERVER_ERROR;
-            }
+            StatusCode::BAD_REQUEST
         }
     }
-    StatusCode::OK
+}
+
+// Drops a chat's alerts when the bot's uninstalled from it, those set before then, as OpenChat may
+// send it again, eg. after the bot was installed again. Other notifications are ignored.
+fn notified(alerts: &Alerts, notification: BotEventWrapper) {
+    if let BotEvent::Lifecycle(BotLifecycleEvent::Uninstalled(uninstalled)) = notification.event {
+        // Older notifications have no timestamp
+        let at = match notification.timestamp {
+            0 => TimestampMillis::MAX,
+            at => at,
+        };
+        let dropped = alerts.remove_at(uninstalled.location, at);
+        info!(location = ?uninstalled.location, dropped, "Uninstalled");
+    }
 }
 
 fn reply(error: PriceError) -> String {
@@ -475,8 +558,10 @@ fn internal<E: std::fmt::Debug>(what: &str, e: E) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prices::{CoinMarket, ListedToken, TokenPrice};
     use ic_agent::export::Principal;
-    use oc_bots_sdk::types::{CanisterId, Chat};
+    use oc_bots_sdk::types::BotUninstalledEvent;
+    use oc_bots_sdk::types::{CanisterId, Chat, InstallationLocation};
     use store::Direction;
 
     fn id(n: u8) -> CanisterId {
@@ -488,6 +573,7 @@ mod tests {
             id: 1,
             user: id(1),
             chat: Chat::Group(id(2)),
+            thread: None,
             api_gateway: id(3),
             symbol: symbol.to_string(),
             source: Source::CoinGecko(symbol.to_lowercase()),
@@ -548,7 +634,7 @@ mod tests {
 
         assert_eq!(
             listed(&alerts, prices),
-            "1. CHAT above $0.05 (now $0.051)\n2. ADA below $0.20"
+            "1. CHAT above $0.05 (now $0.051)\n2. ADA below $0.20 (no price now)"
         );
         assert!(listed(&[], prices).starts_with("You have no alerts"));
     }
@@ -561,6 +647,179 @@ mod tests {
         assert_eq!(usd(0.002345), "$0.002345");
         assert_eq!(usd(5.0), "$5.00");
         assert_eq!(usd(67123.4), "$67,123");
+    }
+
+    #[test]
+    fn targets_are_shown_as_they_were_given() {
+        assert_eq!(target_usd(0.05), "$0.05");
+        assert_eq!(target_usd(4.555), "$4.555");
+        assert_eq!(target_usd(0.029995), "$0.029995");
+        assert_eq!(target_usd(0.2), "$0.20");
+        assert_eq!(target_usd(5.0), "$5.00");
+        assert_eq!(target_usd(100_000.0), "$100,000.00");
+    }
+
+    fn sent() -> Result<send_message::Response, ()> {
+        Ok(send_message::Response::Success(
+            send_message::SuccessResult {
+                message_id: 1.into(),
+                event_index: 1,
+                message_index: 1,
+                timestamp: 1,
+                expires_at: None,
+            },
+        ))
+    }
+
+    fn refused(code: OCErrorCode) -> Result<send_message::Response, ()> {
+        Ok(send_message::Response::Error(code.with_message("refused")))
+    }
+
+    #[test]
+    fn an_alert_which_couldnt_reach_its_chat_is_tried_again() {
+        assert_eq!(posted(&sent()), Posted::Yes);
+        assert_eq!(
+            posted(&refused(OCErrorCode::InitiatorNotAuthorized)),
+            Posted::Refused
+        );
+        // eg. the chat's canister was being upgraded
+        assert_eq!(posted(&refused(OCErrorCode::C2CError)), Posted::Failed);
+        assert_eq!(posted::<()>(&Err(())), Posted::Failed);
+    }
+
+    #[test]
+    fn an_alert_is_done_with_once_posted_or_refused_or_after_a_day_of_failing() {
+        let alert = alert("CHAT", Direction::Above, 0.05);
+        let mut failing_since = HashMap::new();
+
+        assert!(!is_done(&alert, Posted::Failed, &mut failing_since, 1000));
+        assert!(!is_done(
+            &alert,
+            Posted::Failed,
+            &mut failing_since,
+            1000 + GIVE_UP_AFTER - 1
+        ));
+        assert!(is_done(
+            &alert,
+            Posted::Failed,
+            &mut failing_since,
+            1000 + GIVE_UP_AFTER
+        ));
+        assert!(failing_since.is_empty());
+
+        assert!(!is_done(&alert, Posted::Failed, &mut failing_since, 1000));
+        assert!(is_done(&alert, Posted::Yes, &mut failing_since, 2000));
+        assert!(failing_since.is_empty());
+        assert!(is_done(&alert, Posted::Refused, &mut failing_since, 3000));
+    }
+
+    fn token(symbol: &str, source: Source) -> Token {
+        Token {
+            symbol: symbol.to_string(),
+            name: symbol.to_string(),
+            source,
+        }
+    }
+
+    #[test]
+    fn an_alert_is_refused_without_a_price_to_watch() {
+        let chat = id(10);
+        let unpriced = id(11);
+        let market = Market::new(HashMap::new());
+        let chat_token = token("CHAT", Source::Icp(chat));
+        let ada = token("ADA", Source::CoinGecko("cardano".to_string()));
+        let pepe = token("PEPE", Source::CoinGecko("pepe".to_string()));
+
+        let no_prices = "I don't have prices right now. Please try again in a few minutes.";
+        assert_eq!(
+            price_now(&chat_token, &market, now()).unwrap_err(),
+            no_prices
+        );
+        assert_eq!(price_now(&ada, &market, now()).unwrap_err(), no_prices);
+
+        market.set_listed(
+            [(chat, "CHAT"), (unpriced, "UNPRICED")]
+                .into_iter()
+                .map(|(ledger, symbol)| ListedToken {
+                    ledger,
+                    symbol: symbol.to_string(),
+                    name: symbol.to_string(),
+                    enabled: true,
+                })
+                .collect(),
+        );
+        market.set_latest(
+            vec![TokenPrice {
+                ledger: chat,
+                usd: 0.0295,
+                tvl_usd: 60_000.0,
+            }],
+            now(),
+        );
+        market.set_coins(
+            vec![CoinMarket {
+                id: "cardano".to_string(),
+                symbol: "ada".to_string(),
+                name: "Cardano".to_string(),
+                usd: 0.2,
+                updated: now(),
+                sparkline: Vec::new(),
+            }],
+            now(),
+        );
+
+        assert_eq!(price_now(&chat_token, &market, now()), Ok(0.0295));
+        assert_eq!(price_now(&ada, &market, now()), Ok(0.2));
+        assert_eq!(
+            price_now(&token("UNPRICED", Source::Icp(unpriced)), &market, now()).unwrap_err(),
+            "There's no price for UNPRICED to watch."
+        );
+        // a coin outside the 250 largest
+        assert!(
+            price_now(&pepe, &market, now())
+                .unwrap_err()
+                .starts_with("I can't watch PEPE's price")
+        );
+    }
+
+    fn uninstalled(location: InstallationLocation, timestamp: TimestampMillis) -> BotEventWrapper {
+        BotEventWrapper {
+            api_gateway: id(3),
+            event: BotEvent::Lifecycle(BotLifecycleEvent::Uninstalled(BotUninstalledEvent {
+                uninstalled_by: id(1),
+                location,
+            })),
+            timestamp,
+            notification_index: 1,
+        }
+    }
+
+    #[test]
+    fn uninstalling_drops_the_alerts_set_before_then_in_its_chats() {
+        let alerts = Alerts::load(None).unwrap();
+        let group = id(2);
+        alerts.add(alert("CHAT", Direction::Above, 0.05)).unwrap();
+        let since = alerts
+            .add(Alert {
+                set_at: 2000,
+                ..alert("ICP", Direction::Below, 4.0)
+            })
+            .unwrap()
+            .unwrap();
+
+        notified(
+            &alerts,
+            uninstalled(InstallationLocation::Group(id(9)), 1000),
+        );
+        assert_eq!(alerts.all().len(), 2);
+        notified(
+            &alerts,
+            uninstalled(InstallationLocation::Group(group), 1000),
+        );
+        assert_eq!(alerts.all(), [since]);
+        // a notification without a timestamp drops them all
+        notified(&alerts, uninstalled(InstallationLocation::Group(group), 0));
+        assert!(alerts.all().is_empty());
     }
 
     #[test]

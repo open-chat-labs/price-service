@@ -1,12 +1,16 @@
 //! The alerts waiting to fire, in memory and in a JSON file, so that they outlast restarts and
-//! deploys. Each change is written to the file before it's kept, so the two always agree.
+//! deploys. Each change is written to the file as it's made.
 
-use crate::prices::Source;
+use crate::prices::{Source, now};
 use anyhow::{Context, Result};
-use oc_bots_sdk::types::{CanisterId, Chat, InstallationLocation, TimestampMillis, UserId};
+use oc_bots_sdk::types::{
+    CanisterId, Chat, InstallationLocation, MessageIndex, TimestampMillis, UserId,
+};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use tracing::{error, warn};
 
 /// The most alerts someone can have waiting in a chat
 pub const MAX_PER_USER_PER_CHAT: usize = 20;
@@ -41,6 +45,9 @@ pub struct Alert {
     pub user: UserId,
     /// Where it was set, and is posted
     pub chat: Chat,
+    /// The thread it was set in, if it was
+    #[serde(default)]
+    pub thread: Option<MessageIndex>,
     /// The canister the bot posts in the chat through
     pub api_gateway: CanisterId,
     pub symbol: String,
@@ -65,14 +72,24 @@ pub struct Alerts {
 
 impl Alerts {
     /// The alerts in `file`, which each change is written to. Without a file they're only kept in
-    /// memory, eg. in tests.
+    /// memory, eg. in tests. A file that can't be parsed, eg. one cut short, is moved aside, to
+    /// start with no alerts rather than not at all.
     pub fn load(file: Option<PathBuf>) -> Result<Self> {
         let saved = match &file {
             Some(file) if file.exists() => {
                 let json = std::fs::read(file)
                     .with_context(|| format!("Failed to read the alerts in {}", file.display()))?;
-                serde_json::from_slice(&json)
-                    .with_context(|| format!("Failed to parse the alerts in {}", file.display()))?
+                match serde_json::from_slice(&json) {
+                    Ok(saved) => saved,
+                    Err(e) => {
+                        let aside = file.with_extension(format!("json.unreadable-{}", now()));
+                        std::fs::rename(file, &aside).with_context(|| {
+                            format!("Failed to move the alerts in {} aside", file.display())
+                        })?;
+                        warn!(error = %e, aside = %aside.display(), "The alerts couldn't be parsed, so they were moved aside");
+                        Saved::default()
+                    }
+                }
             }
             _ => Saved::default(),
         };
@@ -82,22 +99,28 @@ impl Alerts {
         })
     }
 
-    /// Adds the alert, giving it an id, unless its user has as many as they can have in its chat
+    /// Adds the alert, giving it an id, unless its user has as many as they can have in its chat.
+    /// It's only added once it's saved, so an alert someone's told failed to set never fires.
     pub fn add(&self, mut alert: Alert) -> Result<Option<Alert>> {
-        self.change(|saved| {
-            let in_chat = saved
-                .alerts
-                .iter()
-                .filter(|a| a.user == alert.user && a.chat == alert.chat)
-                .count();
-            if in_chat >= MAX_PER_USER_PER_CHAT {
-                return None;
-            }
-            saved.next_id += 1;
-            alert.id = saved.next_id;
-            saved.alerts.push(alert.clone());
-            Some(alert)
-        })
+        let mut saved = self.saved.lock().unwrap();
+        let in_chat = saved
+            .alerts
+            .iter()
+            .filter(|a| a.user == alert.user && a.chat == alert.chat)
+            .count();
+        if in_chat >= MAX_PER_USER_PER_CHAT {
+            return Ok(None);
+        }
+
+        let mut changed = saved.clone();
+        changed.next_id += 1;
+        alert.id = changed.next_id;
+        changed.alerts.push(alert.clone());
+        if let Some(file) = &self.file {
+            write(file, &changed)?;
+        }
+        *saved = changed;
+        Ok(Some(alert))
     }
 
     /// The user's alerts in the chat, oldest first, as `/alerts` numbers them
@@ -113,8 +136,8 @@ impl Alerts {
     }
 
     /// Removes the user's `n`th alert in the chat, counting from 1, as `/alerts` numbers them
-    pub fn remove_nth(&self, user: UserId, chat: Chat, n: usize) -> Result<Option<Alert>> {
-        self.change(|saved| {
+    pub fn remove_nth(&self, user: UserId, chat: Chat, n: usize) -> Option<Alert> {
+        self.remove_where(|saved| {
             let index = saved
                 .alerts
                 .iter()
@@ -127,22 +150,23 @@ impl Alerts {
     }
 
     /// Removes the alert, eg. once it's fired. Returns whether it was there.
-    pub fn remove(&self, id: u64) -> Result<bool> {
-        self.change(|saved| {
+    pub fn remove(&self, id: u64) -> bool {
+        self.remove_where(|saved| {
             let before = saved.alerts.len();
             saved.alerts.retain(|a| a.id != id);
             saved.alerts.len() < before
         })
     }
 
-    /// Removes every alert in the chats the bot was uninstalled from: a group, a direct chat, or
-    /// all a community's channels. Returns how many.
-    pub fn remove_at(&self, location: InstallationLocation) -> Result<usize> {
-        self.change(|saved| {
+    /// Removes the alerts set by `at` in the chats the bot was uninstalled from: a group, a direct
+    /// chat, or all a community's channels. Those set since, eg. after it was installed again, are
+    /// kept, as the notice can come late. Returns how many were removed.
+    pub fn remove_at(&self, location: InstallationLocation, at: TimestampMillis) -> usize {
+        self.remove_where(|saved| {
             let before = saved.alerts.len();
             saved
                 .alerts
-                .retain(|a| InstallationLocation::from(a.chat) != location);
+                .retain(|a| InstallationLocation::from(a.chat) != location || a.set_at > at);
             before - saved.alerts.len()
         })
     }
@@ -151,28 +175,33 @@ impl Alerts {
         self.saved.lock().unwrap().alerts.clone()
     }
 
-    // Changes a copy, writes it to the file, then keeps it, so a failure to save changes nothing
-    fn change<T>(&self, f: impl FnOnce(&mut Saved) -> T) -> Result<T> {
+    // A removal is kept even if it can't be saved, as a fired alert left in memory would be posted
+    // again at every refresh. The file catches up at the next change that's saved.
+    fn remove_where<T>(&self, f: impl FnOnce(&mut Saved) -> T) -> T {
         let mut saved = self.saved.lock().unwrap();
-        let mut changed = saved.clone();
-        let result = f(&mut changed);
-        if let Some(file) = &self.file {
-            write(file, &changed)?;
+        let result = f(&mut saved);
+        if let Some(file) = &self.file
+            && let Err(e) = write(file, &saved)
+        {
+            error!(error = ?e, "Failed to save the alerts after removing some");
         }
-        *saved = changed;
-        Ok(result)
+        result
     }
 }
 
-// Written to a temporary file then renamed over the old one, so a crash mid-write leaves the old
-// alerts rather than half the new ones
-fn write(file: &PathBuf, saved: &Saved) -> Result<()> {
+// Written to a temporary file, flushed to disk, then renamed over the old one, so a crash or a
+// power cut mid-write leaves the old alerts rather than half the new ones
+fn write(file: &Path, saved: &Saved) -> Result<()> {
     if let Some(dir) = file.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("Failed to create {}", dir.display()))?;
     }
     let temporary = file.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_vec(saved)?)
+    let mut written = std::fs::File::create(&temporary)
+        .with_context(|| format!("Failed to create {}", temporary.display()))?;
+    written
+        .write_all(&serde_json::to_vec(saved)?)
+        .and_then(|()| written.sync_all())
         .with_context(|| format!("Failed to write {}", temporary.display()))?;
     std::fs::rename(&temporary, file)
         .with_context(|| format!("Failed to replace {}", file.display()))?;
@@ -193,6 +222,7 @@ mod tests {
             id: 0,
             user: id(user),
             chat,
+            thread: None,
             api_gateway: id(100),
             symbol: "CHAT".to_string(),
             source: Source::Icp(id(200)),
@@ -230,9 +260,9 @@ mod tests {
         let mine: Vec<u64> = alerts.of(id(1), group()).iter().map(|a| a.id).collect();
         assert_eq!(mine, [first.id, second.id]);
 
-        assert_eq!(alerts.remove_nth(id(1), group(), 2).unwrap(), Some(second));
-        assert_eq!(alerts.remove_nth(id(1), group(), 2).unwrap(), None);
-        assert_eq!(alerts.remove_nth(id(1), group(), 0).unwrap(), None);
+        assert_eq!(alerts.remove_nth(id(1), group(), 2), Some(second));
+        assert_eq!(alerts.remove_nth(id(1), group(), 2), None);
+        assert_eq!(alerts.remove_nth(id(1), group(), 0), None);
         assert_eq!(alerts.all().len(), 3);
     }
 
@@ -257,17 +287,90 @@ mod tests {
         alerts.add(alert(2, Chat::Channel(community, 2))).unwrap();
         alerts.add(alert(1, Chat::Group(id(11)))).unwrap();
 
-        let dropped = alerts
-            .remove_at(InstallationLocation::Community(community))
-            .unwrap();
+        let dropped = alerts.remove_at(InstallationLocation::Community(community), 1);
         assert_eq!(dropped, 2);
         assert_eq!(
-            alerts
-                .remove_at(InstallationLocation::Group(id(GROUP)))
-                .unwrap(),
+            alerts.remove_at(InstallationLocation::Group(id(GROUP)), 1),
             1
         );
         assert_eq!(alerts.all()[0].chat, Chat::Group(id(11)));
+    }
+
+    #[test]
+    fn a_late_uninstall_keeps_the_alerts_set_since() {
+        let alerts = Alerts::load(None).unwrap();
+        alerts.add(alert(1, group())).unwrap();
+        let since = alerts
+            .add(Alert {
+                set_at: 3,
+                ..alert(1, group())
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            alerts.remove_at(InstallationLocation::Group(id(GROUP)), 2),
+            1
+        );
+        assert_eq!(alerts.all(), [since]);
+    }
+
+    // A directory where the file should be, so it can't be written
+    fn unwritable(test: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("price-alerts-{test}-{}", std::process::id()));
+        let file = dir.join("alerts.json");
+        std::fs::create_dir_all(&file).unwrap();
+        (dir, file)
+    }
+
+    #[test]
+    fn an_alert_which_cant_be_saved_isnt_added() {
+        let (dir, file) = unwritable("unsaved-add");
+        let alerts = Alerts::load(None).unwrap();
+        let alerts = Alerts {
+            file: Some(file),
+            ..alerts
+        };
+
+        assert!(alerts.add(alert(1, group())).is_err());
+        assert!(alerts.all().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_alert_is_removed_even_if_that_cant_be_saved() {
+        let (dir, file) = unwritable("unsaved-remove");
+        let alerts = Alerts::load(None).unwrap();
+        let fired = alerts.add(alert(1, group())).unwrap().unwrap();
+        let alerts = Alerts {
+            file: Some(file),
+            ..alerts
+        };
+
+        // so a fired alert isn't posted again at the next refresh
+        assert!(alerts.remove(fired.id));
+        assert!(alerts.all().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn alerts_which_cant_be_parsed_are_moved_aside() {
+        let dir = std::env::temp_dir().join(format!("price-alerts-cut-{}", std::process::id()));
+        let file = dir.join("alerts.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, "{\"next_id\":3,\"ale").unwrap();
+
+        let alerts = Alerts::load(Some(file.clone())).unwrap();
+
+        assert!(alerts.all().is_empty());
+        assert!(!file.exists());
+        let aside: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(aside.len(), 1);
+        // and new ones are saved as before
+        alerts.add(alert(1, group())).unwrap();
+        assert_eq!(Alerts::load(Some(file)).unwrap().all().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -279,7 +382,7 @@ mod tests {
         let alerts = Alerts::load(Some(file.clone())).unwrap();
         let first = alerts.add(alert(1, group())).unwrap().unwrap();
         let second = alerts.add(alert(2, group())).unwrap().unwrap();
-        alerts.remove(first.id).unwrap();
+        alerts.remove(first.id);
 
         let reloaded = Alerts::load(Some(file.clone())).unwrap();
         assert_eq!(reloaded.all(), std::slice::from_ref(&second));

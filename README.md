@@ -165,8 +165,8 @@ prices. The code is in [`src/alert_bot`](./src/alert_bot).
 - `/alerts` lists your alerts in the chat, numbered, each with its token's price now.
 - `/remove_alert 2` removes the second.
 
-When a price reaches its target, the bot posts in the chat, eg. "@alice CHAT is above $0.05: it's
-$0.0512 now.", and removes the alert, so it fires once.
+When a price reaches its target, the bot posts in the chat, or the thread the alert was set in, eg.
+"@alice CHAT is above $0.05: it's $0.0512 now.", and removes the alert, so it fires once.
 
 - **Tokens:** those the price API has, ie. the tokens OpenChat lists and the 250 largest coins,
   matched by symbol as ChartBot matches them. A leading `$` on the symbol or the price is ignored,
@@ -174,17 +174,24 @@ $0.0512 now.", and removes the alert, so it fires once.
   string parameter, which the bot splits into the three.
 - **Checking:** each time the prices refresh, so every minute for OpenChat's tokens, from ICPSwap,
   and every 6 minutes for the coins, from CoinGecko. A price that crosses a target and comes back
-  between two refreshes isn't caught.
+  between two refreshes isn't caught. An alert whose price the service no longer has, eg. as its
+  coin has left the 250 largest, isn't checked until it has, and `/alerts` says so.
 - **Where:** groups and community channels. Its commands only reply to whoever ran them, so need no
   permissions. Posting the alerts needs one, to send text messages without a command, which OpenChat
   asks for when it's installed.
 - **Limits:** 20 alerts per person per chat.
 - **Storage:** the alerts are kept in a JSON file, `ALERTS_FILE`, rewritten on each change, so they
   outlast restarts and deploys. On AWS it's on the host, in `/var/lib/oc-price-service`.
-- **Clearing up:** when the bot's uninstalled from a chat, OpenChat tells it, at `/notify`, and its
-  alerts there are dropped. An alert OpenChat won't post, eg. as the bot can no longer post in the
-  chat, is dropped too, rather than tried again each minute. One that couldn't reach OpenChat is
-  tried again at the next refresh.
+  - A file that can't be parsed, eg. one cut short, is moved aside, to `.json.unreadable-<time>`,
+    and the bot starts with no alerts. One that can't be read leaves PriceAlertBot off, but not the
+    prices or ChartBot.
+  - A fired alert is removed even if the file can't be written then, so it isn't posted again.
+- **Clearing up:** when the bot's uninstalled from a chat, OpenChat tells it, at `/notify`, and the
+  alerts set there before then are dropped. An alert OpenChat won't post, eg. as the bot can no
+  longer post in the chat, is dropped too, rather than tried again each minute.
+- **Retries:** an alert that couldn't reach OpenChat, or the chat's canister, eg. while it's
+  upgraded, is tried again at each refresh, for up to a day. Deleting a group doesn't tell its
+  bots, so its alerts go then.
 - **Mentions:** the post mentions whoever set the alert, which OpenChat shows as their @username. But
   OpenChat doesn't yet pass a bot's mentions on (`c2c_bot_send_message` sends none), so it doesn't
   notify them as a person's mention would.

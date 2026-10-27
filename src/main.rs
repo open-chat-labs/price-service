@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
-use tracing::info;
+use tracing::{error, info};
 
 mod alert_bot;
 mod api;
@@ -52,44 +52,58 @@ async fn main() -> Result<()> {
     let prices = Arc::new(Prices::new(market.clone(), coingecko, icpswap));
     let chart_commands = CommandHandlerRegistry::new(chart_bot.client_factory)
         .register(Chart::new(prices.clone(), config.storage_index));
-    let mut routes = bot::routes(
+    let chart_routes = bot::routes(
         chart_bot::definition(chart_commands.definitions()),
         config.oc_public_key.clone(),
         chart_commands,
-    )
-    .merge(api::router(market.clone()));
+    );
 
-    // PriceAlertBot, given an identity of its own. It's under /alerts, which its own endpoint, a
-    // host of its own, maps to, as OpenChat only registers a bot at an origin.
+    // PriceAlertBot, given an identity of its own
+    let mut alert_routes = None;
     if let Some(pem) = &config.alert_bot_identity_pem {
         let alert_bot = BotIdentity::new(pem, config.ic_url.clone()).await?;
         info!(principal = %alert_bot.principal, "PriceAlertBot starting");
-        let alerts = Arc::new(Alerts::load(Some(config.alerts_file.clone()))?);
-        alert_bot::spawn_checker(
-            alert_bot.client_factory.clone(),
-            market.clone(),
-            alerts.clone(),
-        );
-        let alert_routes = alert_bot::routes(
-            alert_bot.client_factory,
-            prices,
-            market,
-            alerts,
-            config.oc_public_key.clone(),
-        );
-        routes = routes.nest("/alerts", alert_routes.clone());
-        // Locally, its own origin is a port of its own
-        if let Some(port) = config.alert_bot_port {
-            let listener = listen(port).await?;
-            info!(port, "PriceAlertBot ready on its own port");
-            tokio::spawn(axum::serve(listener, with_layers(alert_routes)).into_future());
+        // Without its alerts it's left off, rather than stopping the prices and ChartBot too
+        match Alerts::load(Some(config.alerts_file.clone())) {
+            Ok(alerts) => {
+                let alerts = Arc::new(alerts);
+                alert_bot::spawn_checker(
+                    alert_bot.client_factory.clone(),
+                    market.clone(),
+                    alerts.clone(),
+                );
+                alert_routes = Some(alert_bot::routes(
+                    alert_bot.client_factory,
+                    prices,
+                    market.clone(),
+                    alerts,
+                    config.oc_public_key.clone(),
+                ));
+            }
+            Err(e) => error!(error = ?e, "Failed to load the alerts, so PriceAlertBot is off"),
         }
+    }
+    // Locally, its own origin is a port of its own
+    if let (Some(alert_routes), Some(port)) = (&alert_routes, config.alert_bot_port) {
+        let listener = listen(port).await?;
+        info!(port, "PriceAlertBot ready on its own port");
+        tokio::spawn(axum::serve(listener, with_layers(alert_routes.clone())).into_future());
     }
 
     let listener = listen(config.port).await?;
     info!(port = config.port, "Price service ready");
-    axum::serve(listener, with_layers(routes)).await?;
+    axum::serve(listener, app(chart_routes, alert_routes, market)).await?;
     Ok(())
+}
+
+// ChartBot at the root, with the prices under /v1, and PriceAlertBot under /alerts, which its own
+// endpoint, a host of its own, maps to, as OpenChat only registers a bot at an origin
+fn app(chart_bot: Router, alert_bot: Option<Router>, market: Arc<Market>) -> Router {
+    let mut routes = chart_bot.merge(api::router(market));
+    if let Some(alert_bot) = alert_bot {
+        routes = routes.nest("/alerts", alert_bot);
+    }
+    with_layers(routes)
 }
 
 async fn listen(port: u16) -> Result<tokio::net::TcpListener> {
@@ -116,6 +130,8 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, Response, StatusCode, header};
     use ic_agent::export::Principal;
+    use oc_bots_sdk::oc_api::client::ClientFactory;
+    use oc_bots_sdk_offchain::AgentRuntime;
     use std::collections::HashMap;
     use tower::ServiceExt;
 
@@ -387,5 +403,68 @@ mod tests {
             .iter()
             .collect();
         assert_eq!(origins, ["*"]);
+    }
+    // Built and dropped outside the requests' runtime, as the bot's client has a runtime of its own
+    #[test]
+    fn price_alert_bot_is_served_under_alerts_beside_the_prices() {
+        let agent = Agent::builder()
+            .with_url("http://127.0.0.1:1")
+            .build()
+            .unwrap();
+        let client_factory = Arc::new(ClientFactory::new(AgentRuntime::new(
+            agent,
+            tokio::runtime::Runtime::new().unwrap(),
+        )));
+        let market = market();
+        let http = prices::http_client().unwrap();
+        let prices = Arc::new(Prices::new(
+            market.clone(),
+            Arc::new(CoinGecko::new(http.clone(), None)),
+            Arc::new(IcpSwap::new(http)),
+        ));
+        let alert_bot = alert_bot::routes(
+            client_factory,
+            prices,
+            market.clone(),
+            Arc::new(Alerts::load(None).unwrap()),
+            "OpenChat's key".to_string(),
+        );
+        let app = app(Router::new(), Some(alert_bot), market);
+        let send = |request: Request<Body>| {
+            let app = app.clone();
+            async move { app.oneshot(request).await.unwrap() }
+        };
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let response = send(
+                Request::get("/alerts/bot_definition")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let definition = json(response).await;
+            assert!(
+                definition["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("/alert CHAT above 0.05")
+            );
+
+            // Notifications are signed by OpenChat rather than sent with a JWT, so they reach the
+            // bot, which refuses a bad signature, where a command without a JWT is a 401
+            let notification = Request::post("/alerts/notify")
+                .header("x-oc-signature", "bad")
+                .body(Body::from("{}"))
+                .unwrap();
+            assert_eq!(send(notification).await.status(), StatusCode::BAD_REQUEST);
+            let command = Request::post("/alerts/execute_command")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(send(command).await.status(), StatusCode::UNAUTHORIZED);
+
+            let prices = send(Request::get("/v1/prices").body(Body::empty()).unwrap()).await;
+            assert_eq!(prices.status(), StatusCode::OK);
+        });
     }
 }
