@@ -166,7 +166,8 @@ prices. The code is in [`src/alert_bot`](./src/alert_bot).
   cancels the alert.
 - `/alerts` lists your alerts in the chat, numbered, each with its token's price now. Only you see
   it.
-- `/remove_alert 2` removes the second.
+- `/remove_alert 2` removes the second, and strikes out its confirmation, eg. "~~I'll reply here
+  when CHAT goes above $0.05. It's $0.0295 now.~~".
 
 When a price reaches its target, the bot replies to the alert's confirmation, eg. "CHAT is above
 $0.05: it's $0.0512 now.", in the chat or the thread the alert was set in, and removes the alert, so
@@ -182,8 +183,12 @@ it fires once.
   coin has left the 250 largest, isn't checked until it has, and `/alerts` says so.
 - **Where:** groups and community channels.
 - **Permissions:** to send text messages, for `/alert`'s confirmations, and to send them without a
-  command, for the alerts. OpenChat asks for both when it's installed. `/alerts` and `/remove_alert`
-  only reply to whoever ran them, so need none.
+  command, for the alerts and to strike out a removed alert's confirmation. OpenChat asks for both
+  when it's installed. `/alerts` and `/remove_alert` only reply to whoever ran them, so need none.
+- **Striking out:** the bot edits a removed alert's confirmation on its own, as OpenChat only lets a
+  bot edit its messages that way. A failed edit isn't tried again, eg. one that reached OpenChat
+  before the confirmation it strikes out. Alerts set before the bot kept their confirmations' text
+  are left as they are.
 - **Limits:** 20 alerts per person per chat.
 - **Storage:** the alerts are kept in a JSON file, `ALERTS_FILE`, rewritten on each change, so they
   outlast restarts and deploys. On AWS it's on the host, in `/var/lib/oc-price-service`.

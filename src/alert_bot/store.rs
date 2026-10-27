@@ -58,6 +58,10 @@ pub struct Alert {
     /// it fires
     #[serde(default)]
     pub confirmation: Option<EventIndex>,
+    /// The confirmation's text, which is struck out if the alert's removed. An alert saved before
+    /// it was kept has none.
+    #[serde(default)]
+    pub confirmation_text: Option<String>,
     /// The id the alert's posted with when it fires, the same at every attempt, so that one which
     /// OpenChat took, though its answer was lost, isn't posted again
     #[serde(default = "new_message_id")]
@@ -313,6 +317,7 @@ mod tests {
             thread: None,
             confirmation_id: None,
             confirmation: None,
+            confirmation_text: None,
             post_id: 1.into(),
             api_gateway: id(100),
             symbol: "CHAT".to_string(),
@@ -530,6 +535,16 @@ mod tests {
         let b: Alert = serde_json::from_value(saved).unwrap();
 
         assert_ne!(a.post_id, b.post_id);
+    }
+
+    #[test]
+    fn an_alert_saved_before_its_confirmations_text_was_kept_has_none() {
+        let mut saved = serde_json::to_value(alert(1, group())).unwrap();
+        saved.as_object_mut().unwrap().remove("confirmation_text");
+
+        let alert: Alert = serde_json::from_value(saved).unwrap();
+
+        assert_eq!(alert.confirmation_text, None);
     }
 
     #[test]
