@@ -1,6 +1,6 @@
 //! PriceAlertBot, which confirms `/alert CHAT above 0.05` in the chat, then replies to that
-//! confirmation when the token's price goes above or below the one given. `/alerts` lists someone's
-//! alerts in the chat, and `/remove_alert` removes one. Prices come from the same market as ChartBot's and the website's,
+//! confirmation when the token's price goes above or below the one given. Deleting the confirmation
+//! cancels the alert. `/alerts` lists someone's alerts in the chat, and `/remove_alert` removes one. Prices come from the same market as ChartBot's and the website's,
 //! and the alerts are checked each time it refreshes. See the README.
 
 use crate::bot;
@@ -24,9 +24,9 @@ use oc_bots_sdk::api::event_notification::{BotEvent, BotEventWrapper, BotLifecyc
 use oc_bots_sdk::oc_api::actions::{ActionArgsBuilder, send_message};
 use oc_bots_sdk::oc_api::client::{Client, ClientFactory};
 use oc_bots_sdk::types::{
-    ActionContext, ActionScope, AutonomousContext, BotCommandContext, BotPermissions,
-    InstallationLocationType, MessageContentInitial, MessagePermission, OCErrorCode,
-    TimestampMillis,
+    ActionContext, ActionScope, AutonomousContext, BotCommandContext, BotPermissions, ChatEvent,
+    EventIndex, InstallationLocationType, MessageContent, MessageContentInitial, MessagePermission,
+    OCErrorCode, TimestampMillis,
 };
 use oc_bots_sdk_offchain::AgentRuntime;
 use std::collections::{HashMap, HashSet};
@@ -108,7 +108,7 @@ pub fn spawn_checker(
         let mut failing_since = HashMap::new();
         while refreshed.changed().await.is_ok() {
             let now = now();
-            let met = met(&alerts.all(), |source| market.price(source, now));
+            let met = met(&alerts.checkable(), |source| market.price(source, now));
             // An alert no longer met, or removed, starts afresh if it fails again
             failing_since.retain(|id, _| met.iter().any(|(alert, _)| alert.id == *id));
             for (alert, price) in met {
@@ -210,15 +210,21 @@ fn is_done(
     true
 }
 
-// eg. "CHAT is above $0.05: it's $0.0512 now."
+// eg. "CHAT is above $0.05: it's $0.0512 now.", replying to the alert's confirmation, which shows
+// whose it is. Without one, eg. as the service stopped before it could note it, it mentions them,
+// which OpenChat shows as their username, though it doesn't notify them.
 fn fired(alert: &Alert, price: f64) -> String {
-    format!(
+    let text = format!(
         "{} is {} {}: it's {} now.",
         alert.symbol,
         alert.direction.word(),
         target_usd(alert.target),
         usd(price)
-    )
+    );
+    match alert.confirmation {
+        Some(_) => text,
+        None => format!("@UserId({}) {text}", alert.user),
+    }
 }
 
 // A target as it was given, eg. $4.555 rather than ChartBot's $4.56, with the cents at least, eg.
@@ -296,14 +302,12 @@ impl CommandHandler<AgentRuntime> for SetAlert {
     ) -> Result<SuccessResult, String> {
         let context = oc_client.context();
         let text: String = context.command.maybe_arg("alert").unwrap_or_default();
-        let alert = match args::parse(&text) {
-            Ok(args) => self.alert(context, args).await,
-            Err(text) => Err(text),
-        };
-        let result = match alert {
-            Ok((alert, price)) => self.set(&oc_client, alert, price).await,
-            Err(refusal) => Err(refusal),
-        };
+        let result = async {
+            let args = args::parse(&text)?;
+            let (alert, price) = self.alert(context, args).await?;
+            self.set(&oc_client, alert, price).await
+        }
+        .await;
         match result {
             Ok(confirmation) => Ok(SuccessResult {
                 message: Some(confirmation),
@@ -359,7 +363,7 @@ impl SetAlert {
 
     // Saves the alert, then confirms it in the chat, noting the confirmation for the alert to reply
     // to. It's saved first, so a confirmation is never posted for an alert that can't be kept, and
-    // removed again if the confirmation can't be posted.
+    // removed again if the confirmation can't be posted. It isn't checked until it's confirmed.
     async fn set(
         &self,
         oc_client: &Client<AgentRuntime, BotCommandContext>,
@@ -384,16 +388,38 @@ impl SetAlert {
             )))
             .execute_async_then_return_message()
             .await;
-        match (message, response) {
-            (Some(message), Ok(send_message::Response::Success(sent))) => {
-                alerts.confirmed(alert.id, sent.event_index);
+        match (message, confirmed_at(response)) {
+            (Some(message), Ok(confirmation)) => {
+                alerts.confirmed(alert.id, confirmation);
                 Ok(message)
             }
-            (_, response) => {
+            (_, result) => {
                 alerts.remove(alert.id);
-                Err(internal("Failed to confirm an alert", response))
+                Err(result
+                    .err()
+                    .unwrap_or_else(|| SOMETHING_WENT_WRONG.to_string()))
             }
         }
+    }
+}
+
+// Where the confirmation was posted, or what to tell whoever set the alert if it wasn't
+fn confirmed_at<E: std::fmt::Debug>(
+    response: Result<send_message::Response, E>,
+) -> Result<EventIndex, String> {
+    match response {
+        Ok(send_message::Response::Success(sent)) => Ok(sent.event_index),
+        // A command's message is posted as whoever ran it, who must have accepted the chat's rules,
+        // which they do by posting a message themselves
+        Ok(send_message::Response::Error(e))
+            if e.matches_code(OCErrorCode::ChatRulesNotAccepted) =>
+        {
+            Err(
+                "Please accept this chat's rules, by sending a message here, then try again."
+                    .to_string(),
+            )
+        }
+        response => Err(internal("Failed to confirm an alert", response)),
     }
 }
 
@@ -576,16 +602,37 @@ async fn notify(
 }
 
 // Drops a chat's alerts when the bot's uninstalled from it, those set before then, as OpenChat may
-// send it again, eg. after the bot was installed again. Other notifications are ignored.
+// send it again, eg. after the bot was installed again. Cancels an alert when its confirmation's
+// deleted, which OpenChat tells the bot about, as the message is its own. Other notifications are
+// ignored, and so is a confirmation being restored, as its alert's gone by then.
 fn notified(alerts: &Alerts, notification: BotEventWrapper) {
-    if let BotEvent::Lifecycle(BotLifecycleEvent::Uninstalled(uninstalled)) = notification.event {
-        // Older notifications have no timestamp
-        let at = match notification.timestamp {
-            0 => TimestampMillis::MAX,
-            at => at,
-        };
-        let dropped = alerts.remove_at(uninstalled.location, at);
-        info!(location = ?uninstalled.location, dropped, "Uninstalled");
+    match notification.event {
+        BotEvent::Lifecycle(BotLifecycleEvent::Uninstalled(uninstalled)) => {
+            // Older notifications have no timestamp
+            let at = match notification.timestamp {
+                0 => TimestampMillis::MAX,
+                at => at,
+            };
+            let dropped = alerts.remove_at(uninstalled.location, at);
+            info!(location = ?uninstalled.location, dropped, "Uninstalled");
+        }
+        BotEvent::Chat(chat_event) => {
+            if let ChatEvent::Message(message) = &chat_event.event
+                && matches!(message.content, MessageContent::Deleted(_))
+                && let Some(alert) = alerts.remove_confirmed(
+                    chat_event.chat,
+                    chat_event.thread,
+                    chat_event.event_index,
+                )
+            {
+                info!(
+                    id = alert.id,
+                    symbol = alert.symbol,
+                    "Cancelled an alert whose confirmation was deleted"
+                );
+            }
+        }
+        _ => {}
     }
 }
 
@@ -608,7 +655,8 @@ mod tests {
     use super::*;
     use crate::prices::{CoinMarket, ListedToken, TokenPrice};
     use ic_agent::export::Principal;
-    use oc_bots_sdk::types::BotUninstalledEvent;
+    use oc_bots_sdk::api::event_notification::BotChatEvent;
+    use oc_bots_sdk::types::{BotUninstalledEvent, DeletedBy, TextContent};
     use oc_bots_sdk::types::{CanisterId, Chat, InstallationLocation};
     use store::Direction;
 
@@ -667,15 +715,38 @@ mod tests {
     #[test]
     fn an_alert_is_confirmed_then_fires_as_a_reply_to_that() {
         let alert = alert("CHAT", Direction::Above, 0.05);
-
         assert_eq!(
             confirmation(&alert, 0.02946),
             "I'll reply here when CHAT goes above $0.05. It's $0.02946 now."
         );
-        // The reply shows whose alert it is, so it needn't mention them
+
+        // The reply shows whose alert it is, so it needn't mention them, unless it has no
+        // confirmation to reply to
+        let confirmed = Alert {
+            confirmation: Some(7),
+            ..alert.clone()
+        };
+        assert_eq!(
+            fired(&confirmed, 0.0512),
+            "CHAT is above $0.05: it's $0.0512 now."
+        );
         assert_eq!(
             fired(&alert, 0.0512),
-            "CHAT is above $0.05: it's $0.0512 now."
+            format!("@UserId({}) CHAT is above $0.05: it's $0.0512 now.", id(1))
+        );
+    }
+
+    #[test]
+    fn a_confirmation_which_couldnt_be_posted_is_explained() {
+        assert_eq!(confirmed_at(sent()), Ok(1));
+        assert!(
+            confirmed_at(refused(OCErrorCode::ChatRulesNotAccepted))
+                .unwrap_err()
+                .contains("accept this chat's rules")
+        );
+        assert_eq!(
+            confirmed_at(refused(OCErrorCode::InitiatorNotAuthorized)).unwrap_err(),
+            SOMETHING_WENT_WRONG
         );
     }
 
@@ -846,6 +917,62 @@ mod tests {
             timestamp,
             notification_index: 1,
         }
+    }
+
+    fn message_event(content: MessageContent, event_index: EventIndex) -> BotEventWrapper {
+        BotEventWrapper {
+            api_gateway: id(3),
+            event: BotEvent::Chat(BotChatEvent {
+                event: ChatEvent::Message(Box::new(oc_bots_sdk::types::Message {
+                    message_index: 4,
+                    message_id: 5.into(),
+                    sender: id(9),
+                    content,
+                    sender_context: None,
+                    replies_to: None,
+                    reactions: Vec::new(),
+                    tips: Vec::new(),
+                    thread_summary: None,
+                    edited: false,
+                    forwarded: false,
+                    block_level_markdown: false,
+                    og_previews: Vec::new(),
+                })),
+                chat: Chat::Group(id(2)),
+                thread: None,
+                event_index,
+                latest_event_index: event_index,
+            }),
+            timestamp: 1000,
+            notification_index: 1,
+        }
+    }
+
+    #[test]
+    fn deleting_a_confirmation_cancels_its_alert() {
+        let alerts = Alerts::load(None).unwrap();
+        let alert = alerts
+            .add(alert("CHAT", Direction::Above, 0.05))
+            .unwrap()
+            .unwrap();
+        alerts.confirmed(alert.id, 7);
+        let deleted = || {
+            MessageContent::Deleted(DeletedBy {
+                deleted_by: id(1),
+                timestamp: 1000,
+            })
+        };
+
+        // Another message deleted, or the confirmation restored, leaves it be
+        notified(&alerts, message_event(deleted(), 8));
+        let restored = MessageContent::Text(TextContent {
+            text: "I'll reply here".to_string(),
+        });
+        notified(&alerts, message_event(restored, 7));
+        assert_eq!(alerts.all().len(), 1);
+
+        notified(&alerts, message_event(deleted(), 7));
+        assert!(alerts.all().is_empty());
     }
 
     #[test]

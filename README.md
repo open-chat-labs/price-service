@@ -162,7 +162,8 @@ prices. The code is in [`src/alert_bot`](./src/alert_bot).
 
 - `/alert CHAT above 0.05` sets an alert, which the bot confirms in the chat, eg. "I'll reply here
   when CHAT goes above $0.05. It's $0.0295 now." An alert that's already met, eg. CHAT above $0.05
-  when it's $0.06, is refused, and only whoever tried to set it is told.
+  when it's $0.06, is refused, and only whoever tried to set it is told. Deleting the confirmation
+  cancels the alert.
 - `/alerts` lists your alerts in the chat, numbered, each with its token's price now. Only you see
   it.
 - `/remove_alert 2` removes the second.
@@ -200,9 +201,15 @@ it fires once.
   rather than mentions them, as OpenChat doesn't pass a bot's mentions on (`c2c_bot_send_message`
   sends none). An OpenChat change on its way notifies whoever ran a command when a bot replies to
   its response. Until that's live, the reply notifies nobody.
-- **A deleted confirmation:** an alert whose confirmation was deleted is posted as a reply to the
-  deleted message, which quotes it as deleted. A deleted message keeps who it was for, so the reply
-  still notifies whoever set the alert, once OpenChat's change is live.
+- **Confirming:** the confirmation's posted as a command's response, so whoever set the alert must
+  have accepted the chat's rules, which they're asked to do if they haven't. An alert isn't checked
+  until its confirmation's posted. If the service stops in between, the alert fires without a reply
+  after a restart, mentioning them instead.
+- **A deleted confirmation** cancels its alert: OpenChat tells a bot when its own message is deleted.
+  Until that OpenChat change is live, the alert fires anyway, as a reply to the deleted message.
+  Restoring the confirmation doesn't restore the alert.
+- **Disappearing messages:** in a chat where they disappear, an alert that fires after its
+  confirmation's gone replies to a message that no longer shows.
 - **Its own endpoint:** OpenChat registers a bot only at an origin, eg. `https://example.com` but not
   `https://example.com/alerts`. So PriceAlertBot is served under `/alerts`, and given an origin of
   its own which maps to it: on AWS a CloudFront distribution of its own, and locally a port of its

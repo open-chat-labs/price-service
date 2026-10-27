@@ -7,6 +7,7 @@ use oc_bots_sdk::types::{
     CanisterId, Chat, EventIndex, InstallationLocation, MessageIndex, TimestampMillis, UserId,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -67,6 +68,10 @@ struct Saved {
     next_id: u64,
     // Oldest first
     alerts: Vec<Alert>,
+    // Those whose confirmation is being posted, which aren't checked until it is, so that they
+    // reply to it. They're only kept in memory: after a restart, they fire without a reply.
+    #[serde(skip)]
+    confirming: HashSet<u64>,
 }
 
 pub struct Alerts {
@@ -120,6 +125,7 @@ impl Alerts {
         changed.next_id += 1;
         alert.id = changed.next_id;
         changed.alerts.push(alert.clone());
+        changed.confirming.insert(alert.id);
         if let Some(file) = &self.file {
             write(file, &changed)?;
         }
@@ -139,12 +145,28 @@ impl Alerts {
             .collect()
     }
 
-    /// Notes the message the alert was confirmed with
+    /// Notes the message the alert was confirmed with, after which it's checked
     pub fn confirmed(&self, id: u64, confirmation: EventIndex) {
         self.change(|saved| {
+            saved.confirming.remove(&id);
             if let Some(alert) = saved.alerts.iter_mut().find(|a| a.id == id) {
                 alert.confirmation = Some(confirmation);
             }
+        })
+    }
+
+    /// Removes the alert confirmed with the message at `confirmation`, eg. as it was deleted
+    pub fn remove_confirmed(
+        &self,
+        chat: Chat,
+        thread: Option<MessageIndex>,
+        confirmation: EventIndex,
+    ) -> Option<Alert> {
+        self.change(|saved| {
+            let index = saved.alerts.iter().position(|a| {
+                a.chat == chat && a.thread == thread && a.confirmation == Some(confirmation)
+            })?;
+            Some(saved.alerts.remove(index))
         })
     }
 
@@ -165,6 +187,7 @@ impl Alerts {
     /// Removes the alert, eg. once it's fired. Returns whether it was there.
     pub fn remove(&self, id: u64) -> bool {
         self.change(|saved| {
+            saved.confirming.remove(&id);
             let before = saved.alerts.len();
             saved.alerts.retain(|a| a.id != id);
             saved.alerts.len() < before
@@ -184,8 +207,20 @@ impl Alerts {
         })
     }
 
+    #[cfg(test)]
     pub fn all(&self) -> Vec<Alert> {
         self.saved.lock().unwrap().alerts.clone()
+    }
+
+    /// The alerts to check: all but those whose confirmation is still being posted
+    pub fn checkable(&self) -> Vec<Alert> {
+        let saved = self.saved.lock().unwrap();
+        saved
+            .alerts
+            .iter()
+            .filter(|a| !saved.confirming.contains(&a.id))
+            .cloned()
+            .collect()
     }
 
     // Every change but an addition is kept even if it can't be saved, as a fired alert left in
@@ -309,6 +344,51 @@ mod tests {
             1
         );
         assert_eq!(alerts.all()[0].chat, Chat::Group(id(11)));
+    }
+
+    #[test]
+    fn an_alert_is_only_checked_once_its_confirmed() {
+        let alerts = Alerts::load(None).unwrap();
+        let confirming = alerts.add(alert(1, group())).unwrap().unwrap();
+        let abandoned = alerts.add(alert(1, group())).unwrap().unwrap();
+        assert!(alerts.checkable().is_empty());
+
+        alerts.confirmed(confirming.id, 7);
+        alerts.remove(abandoned.id);
+
+        let checkable = alerts.checkable();
+        assert_eq!(checkable.len(), 1);
+        assert_eq!(checkable[0].confirmation, Some(7));
+        // and after a restart, an alert whose confirmation was being posted is checked anyway
+        let saved = alerts.saved.lock().unwrap().clone();
+        let reloaded: Saved = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert!(reloaded.confirming.is_empty());
+    }
+
+    #[test]
+    fn deleting_a_confirmation_removes_its_alert() {
+        let alerts = Alerts::load(None).unwrap();
+        let in_chat = alerts.add(alert(1, group())).unwrap().unwrap();
+        let in_thread = alerts
+            .add(Alert {
+                thread: Some(3),
+                ..alert(1, group())
+            })
+            .unwrap()
+            .unwrap();
+        alerts.confirmed(in_chat.id, 7);
+        alerts.confirmed(in_thread.id, 7);
+
+        // Event indexes count within a chat or a thread, so both have to match
+        let removed = alerts.remove_confirmed(group(), Some(3), 7).unwrap();
+        assert_eq!(removed.id, in_thread.id);
+        assert!(alerts.remove_confirmed(group(), None, 8).is_none());
+        assert!(
+            alerts
+                .remove_confirmed(Chat::Group(id(11)), None, 7)
+                .is_none()
+        );
+        assert_eq!(alerts.all().len(), 1);
     }
 
     #[test]
