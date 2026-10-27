@@ -6,7 +6,7 @@ memory, so it asks the price APIs once however many people want a price. It serv
 - **[The price API](#price-api)**, which OpenChat's website reads every USD value from, and cashtags'
   charts (`$CHAT` in a message), for the tokens OpenChat lists and the largest other coins, eg. ADA.
 - **[ChartBot](#chartbot)**, an OpenChat bot which replies to `/chart` with a price chart.
-- **[PriceAlertBot](#pricealertbot)**, an OpenChat bot which tells you in a chat when a token's
+- **[PriceAlertBot](#pricealertbot)**, an OpenChat bot which replies in a chat when a token's
   price goes above or below one you gave, eg. `/alert CHAT above 0.05`.
 
 ## Price API
@@ -156,17 +156,20 @@ API in [`src/api.rs`](./src/api.rs), and the bot in [`src/chart_bot`](./src/char
 
 ## PriceAlertBot
 
-Tells you, in the chat where you asked, when a token's price goes above or below one you gave. It's
+Replies, in the chat where you asked, when a token's price goes above or below one you gave. It's
 a bot of its own, with its own identity, served by the same container as ChartBot, from the same
 prices. The code is in [`src/alert_bot`](./src/alert_bot).
 
-- `/alert CHAT above 0.05` sets an alert. The bot tells only you that it's set, with CHAT's price
-  now. An alert that's already met, eg. CHAT above $0.05 when it's $0.06, is refused.
-- `/alerts` lists your alerts in the chat, numbered, each with its token's price now.
+- `/alert CHAT above 0.05` sets an alert, which the bot confirms in the chat, eg. "I'll reply here
+  when CHAT goes above $0.05. It's $0.0295 now." An alert that's already met, eg. CHAT above $0.05
+  when it's $0.06, is refused, and only whoever tried to set it is told.
+- `/alerts` lists your alerts in the chat, numbered, each with its token's price now. Only you see
+  it.
 - `/remove_alert 2` removes the second.
 
-When a price reaches its target, the bot posts in the chat, or the thread the alert was set in, eg.
-"@alice CHAT is above $0.05: it's $0.0512 now.", and removes the alert, so it fires once.
+When a price reaches its target, the bot replies to the alert's confirmation, eg. "CHAT is above
+$0.05: it's $0.0512 now.", in the chat or the thread the alert was set in, and removes the alert, so
+it fires once.
 
 - **Tokens:** those the price API has, ie. the tokens OpenChat lists and the 250 largest coins,
   matched by symbol as ChartBot matches them. A leading `$` on the symbol or the price is ignored,
@@ -176,9 +179,10 @@ When a price reaches its target, the bot posts in the chat, or the thread the al
   and every 6 minutes for the coins, from CoinGecko. A price that crosses a target and comes back
   between two refreshes isn't caught. An alert whose price the service no longer has, eg. as its
   coin has left the 250 largest, isn't checked until it has, and `/alerts` says so.
-- **Where:** groups and community channels. Its commands only reply to whoever ran them, so need no
-  permissions. Posting the alerts needs one, to send text messages without a command, which OpenChat
-  asks for when it's installed.
+- **Where:** groups and community channels.
+- **Permissions:** to send text messages, for `/alert`'s confirmations, and to send them without a
+  command, for the alerts. OpenChat asks for both when it's installed. `/alerts` and `/remove_alert`
+  only reply to whoever ran them, so need none.
 - **Limits:** 20 alerts per person per chat.
 - **Storage:** the alerts are kept in a JSON file, `ALERTS_FILE`, rewritten on each change, so they
   outlast restarts and deploys. On AWS it's on the host, in `/var/lib/oc-price-service`.
@@ -192,9 +196,12 @@ When a price reaches its target, the bot posts in the chat, or the thread the al
 - **Retries:** an alert that couldn't reach OpenChat, or the chat's canister, eg. while it's
   upgraded, is tried again at each refresh, for up to a day. Deleting a group doesn't tell its
   bots, so its alerts go then.
-- **Mentions:** the post mentions whoever set the alert, which OpenChat shows as their @username. But
-  OpenChat doesn't yet pass a bot's mentions on (`c2c_bot_send_message` sends none), so it doesn't
-  notify them as a person's mention would.
+- **Who's told:** the alert replies to the confirmation, which shows whose alert it is. It replies
+  rather than mentions them, as OpenChat doesn't pass a bot's mentions on (`c2c_bot_send_message`
+  sends none). An OpenChat change on its way notifies whoever ran a command when a bot replies to
+  its response. Until that's live, the reply notifies nobody.
+- **A deleted confirmation:** the alert still replies to it, quoting a deleted message. The bot can't
+  tell it's been deleted, as reading a chat's messages needs a permission it doesn't ask for.
 - **Its own endpoint:** OpenChat registers a bot only at an origin, eg. `https://example.com` but not
   `https://example.com/alerts`. So PriceAlertBot is served under `/alerts`, and given an origin of
   its own which maps to it: on AWS a CloudFront distribution of its own, and locally a port of its

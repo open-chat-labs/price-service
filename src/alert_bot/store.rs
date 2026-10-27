@@ -4,7 +4,7 @@
 use crate::prices::{Source, now};
 use anyhow::{Context, Result};
 use oc_bots_sdk::types::{
-    CanisterId, Chat, InstallationLocation, MessageIndex, TimestampMillis, UserId,
+    CanisterId, Chat, EventIndex, InstallationLocation, MessageIndex, TimestampMillis, UserId,
 };
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -48,6 +48,10 @@ pub struct Alert {
     /// The thread it was set in, if it was
     #[serde(default)]
     pub thread: Option<MessageIndex>,
+    /// The message the bot confirmed it with, in the chat or the thread, which it replies to when
+    /// it fires
+    #[serde(default)]
+    pub confirmation: Option<EventIndex>,
     /// The canister the bot posts in the chat through
     pub api_gateway: CanisterId,
     pub symbol: String,
@@ -135,9 +139,18 @@ impl Alerts {
             .collect()
     }
 
+    /// Notes the message the alert was confirmed with
+    pub fn confirmed(&self, id: u64, confirmation: EventIndex) {
+        self.change(|saved| {
+            if let Some(alert) = saved.alerts.iter_mut().find(|a| a.id == id) {
+                alert.confirmation = Some(confirmation);
+            }
+        })
+    }
+
     /// Removes the user's `n`th alert in the chat, counting from 1, as `/alerts` numbers them
     pub fn remove_nth(&self, user: UserId, chat: Chat, n: usize) -> Option<Alert> {
-        self.remove_where(|saved| {
+        self.change(|saved| {
             let index = saved
                 .alerts
                 .iter()
@@ -151,7 +164,7 @@ impl Alerts {
 
     /// Removes the alert, eg. once it's fired. Returns whether it was there.
     pub fn remove(&self, id: u64) -> bool {
-        self.remove_where(|saved| {
+        self.change(|saved| {
             let before = saved.alerts.len();
             saved.alerts.retain(|a| a.id != id);
             saved.alerts.len() < before
@@ -162,7 +175,7 @@ impl Alerts {
     /// chat, or all a community's channels. Those set since, eg. after it was installed again, are
     /// kept, as the notice can come late. Returns how many were removed.
     pub fn remove_at(&self, location: InstallationLocation, at: TimestampMillis) -> usize {
-        self.remove_where(|saved| {
+        self.change(|saved| {
             let before = saved.alerts.len();
             saved
                 .alerts
@@ -175,15 +188,16 @@ impl Alerts {
         self.saved.lock().unwrap().alerts.clone()
     }
 
-    // A removal is kept even if it can't be saved, as a fired alert left in memory would be posted
-    // again at every refresh. The file catches up at the next change that's saved.
-    fn remove_where<T>(&self, f: impl FnOnce(&mut Saved) -> T) -> T {
+    // Every change but an addition is kept even if it can't be saved, as a fired alert left in
+    // memory would be posted again at every refresh. The file catches up at the next change that's
+    // saved.
+    fn change<T>(&self, f: impl FnOnce(&mut Saved) -> T) -> T {
         let mut saved = self.saved.lock().unwrap();
         let result = f(&mut saved);
         if let Some(file) = &self.file
             && let Err(e) = write(file, &saved)
         {
-            error!(error = ?e, "Failed to save the alerts after removing some");
+            error!(error = ?e, "Failed to save the alerts");
         }
         result
     }
@@ -223,6 +237,7 @@ mod tests {
             user: id(user),
             chat,
             thread: None,
+            confirmation: None,
             api_gateway: id(100),
             symbol: "CHAT".to_string(),
             source: Source::Icp(id(200)),
@@ -381,8 +396,10 @@ mod tests {
 
         let alerts = Alerts::load(Some(file.clone())).unwrap();
         let first = alerts.add(alert(1, group())).unwrap().unwrap();
-        let second = alerts.add(alert(2, group())).unwrap().unwrap();
+        let mut second = alerts.add(alert(2, group())).unwrap().unwrap();
         alerts.remove(first.id);
+        alerts.confirmed(second.id, 7);
+        second.confirmation = Some(7);
 
         let reloaded = Alerts::load(Some(file.clone())).unwrap();
         assert_eq!(reloaded.all(), std::slice::from_ref(&second));

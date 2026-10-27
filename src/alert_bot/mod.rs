@@ -1,6 +1,6 @@
-//! PriceAlertBot, which tells someone, in the chat where they asked, when a token's price goes above
-//! or below one they gave: `/alert CHAT above 0.05`. `/alerts` lists theirs in the chat, and
-//! `/remove_alert` removes one. Prices come from the same market as ChartBot's and the website's,
+//! PriceAlertBot, which confirms `/alert CHAT above 0.05` in the chat, then replies to that
+//! confirmation when the token's price goes above or below the one given. `/alerts` lists someone's
+//! alerts in the chat, and `/remove_alert` removes one. Prices come from the same market as ChartBot's and the website's,
 //! and the alerts are checked each time it refreshes. See the README.
 
 use crate::bot;
@@ -14,7 +14,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use oc_bots_sdk::api::command::{
-    CommandHandler, CommandHandlerRegistry, EphemeralMessageBuilder, SuccessResult,
+    CommandHandler, CommandHandlerRegistry, EphemeralMessageBuilder, Message, SuccessResult,
 };
 use oc_bots_sdk::api::definition::{
     AutonomousConfig, BotCommandDefinition, BotCommandParam, BotCommandParamType, BotDefinition,
@@ -68,12 +68,13 @@ pub fn routes(
     bot::routes(definition(commands.definitions()), oc_public_key, commands).merge(notifications)
 }
 
-/// PriceAlertBot's definition, which OpenChat reads from its endpoint. Its commands only reply
-/// privately, so need no permissions. It needs to send text on its own, to post alerts as they
-/// fire. It's for groups and channels: alerts by direct message are left for later.
+/// PriceAlertBot's definition, which OpenChat reads from its endpoint. `/alert` sends text, to
+/// confirm an alert, and the bot sends text on its own, to post alerts as they fire. The other
+/// commands only reply privately, so need no permissions. It's for groups and channels: alerts by
+/// direct message are left for later.
 pub fn definition(commands: Vec<BotCommandDefinition>) -> BotDefinition {
     BotDefinition {
-        description: "Tells you here when a token's price goes above or below one you give. Try \
+        description: "Replies here when a token's price goes above or below one you give. Try \
             /alert CHAT above 0.05. /alerts lists yours, and /remove_alert removes one."
             .to_string(),
         commands,
@@ -149,7 +150,8 @@ enum Posted {
     Failed,
 }
 
-// Posts the alert in its chat, and its thread if it was set in one, mentioning who set it
+// Posts the alert in its chat, and its thread if it was set in one, as a reply to its confirmation,
+// which shows whose it is
 async fn post_alert(
     client_factory: &ClientFactory<AgentRuntime>,
     alert: &Alert,
@@ -162,6 +164,7 @@ async fn post_alert(
     let response = client
         .send_message(MessageContentInitial::from_text(fired(alert, price)))
         .in_thread(alert.thread)
+        .replies_to(alert.confirmation)
         .execute_async()
         .await;
     let posted = posted(&response);
@@ -207,11 +210,10 @@ fn is_done(
     true
 }
 
-// eg. "@UserId(...) CHAT is above $0.05: it's $0.0512 now."
+// eg. "CHAT is above $0.05: it's $0.0512 now."
 fn fired(alert: &Alert, price: f64) -> String {
     format!(
-        "@UserId({}) {} is {} {}: it's {} now.",
-        alert.user,
+        "{} is {} {}: it's {} now.",
         alert.symbol,
         alert.direction.word(),
         target_usd(alert.target),
@@ -230,8 +232,7 @@ fn target_usd(target: f64) -> String {
     format!("${whole}.{decimals:0<2}")
 }
 
-// A price as ChartBot gives it, without zeros past the cents, eg. $0.05 rather than $0.05000, as
-// a target is usually a round number
+// A price as ChartBot gives it, without zeros past the cents, eg. $0.05 rather than $0.05000
 fn usd(price: f64) -> String {
     let text = format::usd(price);
     match text.split_once('.') {
@@ -258,7 +259,7 @@ struct SetAlert(Arc<BotState>);
 static SET_ALERT: LazyLock<BotCommandDefinition> = LazyLock::new(|| BotCommandDefinition {
     name: "alert".to_string(),
     description: Some(
-        "Tells you here when a token's price goes above or below one you give, eg. CHAT above 0.05"
+        "Replies here when a token's price goes above or below one you give, eg. CHAT above 0.05"
             .to_string(),
     ),
     placeholder: None,
@@ -275,7 +276,8 @@ static SET_ALERT: LazyLock<BotCommandDefinition> = LazyLock::new(|| BotCommandDe
             multi_line: false,
         }),
     }],
-    permissions: BotPermissions::default(),
+    // Its confirmation is a message in the chat, which the alert replies to when it fires
+    permissions: BotPermissions::default().with_message(&HashSet::from([MessagePermission::Text])),
     default_role: None,
     direct_messages: Some(false),
 });
@@ -286,49 +288,57 @@ impl CommandHandler<AgentRuntime> for SetAlert {
         &SET_ALERT
     }
 
+    // An alert that's set is confirmed in the chat. One that isn't is explained only to whoever
+    // tried to set it.
     async fn execute(
         &self,
         oc_client: Client<AgentRuntime, BotCommandContext>,
     ) -> Result<SuccessResult, String> {
         let context = oc_client.context();
         let text: String = context.command.maybe_arg("alert").unwrap_or_default();
-        let reply = match args::parse(&text) {
-            Ok(args) => self.set(context, args).await,
-            Err(text) => text,
+        let alert = match args::parse(&text) {
+            Ok(args) => self.alert(context, args).await,
+            Err(text) => Err(text),
         };
-        privately(context, reply)
+        let result = match alert {
+            Ok((alert, price)) => self.set(&oc_client, alert, price).await,
+            Err(refusal) => Err(refusal),
+        };
+        match result {
+            Ok(confirmation) => Ok(SuccessResult {
+                message: Some(confirmation),
+            }),
+            Err(refusal) => privately(context, refusal),
+        }
     }
 }
 
 impl SetAlert {
-    // What to tell whoever set it
-    async fn set(&self, context: &BotCommandContext, args: AlertArgs) -> String {
-        let BotState {
-            prices,
-            market,
-            alerts,
-        } = &*self.0;
+    // The alert, with the token's price now, or why it can't be set
+    async fn alert(
+        &self,
+        context: &BotCommandContext,
+        args: AlertArgs,
+    ) -> Result<(Alert, f64), String> {
+        let BotState { prices, market, .. } = &*self.0;
         let Some(chat) = context.scope.chat().copied() else {
-            return "Alerts can only be set in a chat.".to_string();
+            return Err("Alerts can only be set in a chat.".to_string());
         };
 
         let token = match prices.find(&args.symbol).await {
             Ok(Some(token)) => token,
-            Ok(None) => return format!("Couldn't find {}.", args.symbol),
-            Err(error) => return reply(error),
+            Ok(None) => return Err(format!("Couldn't find {}.", args.symbol)),
+            Err(error) => return Err(reply(error)),
         };
-        let price = match price_now(&token, market, now()) {
-            Ok(price) => price,
-            Err(reply) => return reply,
-        };
+        let price = price_now(&token, market, now())?;
         if args.direction.is_met(price, args.target) {
-            return format!(
+            return Err(format!(
                 "{} is already {} {}: it's {}.",
                 token.symbol,
                 args.direction.word(),
                 target_usd(args.target),
                 usd(price)
-            );
+            ));
         }
 
         let alert = Alert {
@@ -336,6 +346,7 @@ impl SetAlert {
             user: context.command.initiator,
             chat,
             thread: context.scope.thread(),
+            confirmation: None,
             api_gateway: context.api_gateway,
             symbol: token.symbol,
             source: token.source,
@@ -343,21 +354,58 @@ impl SetAlert {
             target: args.target,
             set_at: now(),
         };
-        match alerts.add(alert) {
-            Ok(Some(alert)) => format!(
-                "I'll tell you here when {} goes {} {}. It's {} now.",
-                alert.symbol,
-                alert.direction.word(),
-                target_usd(alert.target),
-                usd(price)
-            ),
-            Ok(None) => format!(
-                "You have {MAX_PER_USER_PER_CHAT} alerts in this chat, the most you can. Remove \
-                one with /remove_alert."
-            ),
-            Err(e) => internal("Failed to save an alert", e),
+        Ok((alert, price))
+    }
+
+    // Saves the alert, then confirms it in the chat, noting the confirmation for the alert to reply
+    // to. It's saved first, so a confirmation is never posted for an alert that can't be kept, and
+    // removed again if the confirmation can't be posted.
+    async fn set(
+        &self,
+        oc_client: &Client<AgentRuntime, BotCommandContext>,
+        alert: Alert,
+        price: f64,
+    ) -> Result<Message, String> {
+        let alerts = &self.0.alerts;
+        let alert = match alerts.add(alert) {
+            Ok(Some(alert)) => alert,
+            Ok(None) => {
+                return Err(format!(
+                    "You have {MAX_PER_USER_PER_CHAT} alerts in this chat, the most you can. \
+                    Remove one with /remove_alert."
+                ));
+            }
+            Err(e) => return Err(internal("Failed to save an alert", e)),
+        };
+
+        let (message, response) = oc_client
+            .send_message(MessageContentInitial::from_text(confirmation(
+                &alert, price,
+            )))
+            .execute_async_then_return_message()
+            .await;
+        match (message, response) {
+            (Some(message), Ok(send_message::Response::Success(sent))) => {
+                alerts.confirmed(alert.id, sent.event_index);
+                Ok(message)
+            }
+            (_, response) => {
+                alerts.remove(alert.id);
+                Err(internal("Failed to confirm an alert", response))
+            }
         }
     }
+}
+
+// eg. "I'll reply here when CHAT goes above $0.05. It's $0.0295 now."
+fn confirmation(alert: &Alert, price: f64) -> String {
+    format!(
+        "I'll reply here when {} goes {} {}. It's {} now.",
+        alert.symbol,
+        alert.direction.word(),
+        target_usd(alert.target),
+        usd(price)
+    )
 }
 
 // The token's price, which the alert's checked against at each refresh, or why there's none
@@ -574,6 +622,7 @@ mod tests {
             user: id(1),
             chat: Chat::Group(id(2)),
             thread: None,
+            confirmation: None,
             api_gateway: id(3),
             symbol: symbol.to_string(),
             source: Source::CoinGecko(symbol.to_lowercase()),
@@ -616,12 +665,17 @@ mod tests {
     }
 
     #[test]
-    fn a_fired_alert_mentions_whoever_set_it() {
-        let fired = fired(&alert("CHAT", Direction::Above, 0.05), 0.0512);
+    fn an_alert_is_confirmed_then_fires_as_a_reply_to_that() {
+        let alert = alert("CHAT", Direction::Above, 0.05);
 
         assert_eq!(
-            fired,
-            format!("@UserId({}) CHAT is above $0.05: it's $0.0512 now.", id(1))
+            confirmation(&alert, 0.02946),
+            "I'll reply here when CHAT goes above $0.05. It's $0.02946 now."
+        );
+        // The reply shows whose alert it is, so it needn't mention them
+        assert_eq!(
+            fired(&alert, 0.0512),
+            "CHAT is above $0.05: it's $0.0512 now."
         );
     }
 
@@ -823,20 +877,23 @@ mod tests {
     }
 
     #[test]
-    fn its_commands_need_no_permissions_and_it_posts_only_text() {
+    fn it_only_sends_text() {
         let definition = definition(vec![
             SET_ALERT.clone(),
             LIST_ALERTS.clone(),
             REMOVE_ALERT.clone(),
         ]);
+        let text =
+            BotPermissions::default().with_message(&HashSet::from([MessagePermission::Text]));
 
+        // /alert confirms an alert in the chat, while the others reply privately
         for command in &definition.commands {
-            assert!(command.permissions.is_empty(), "/{}", command.name);
+            let expected = match command.name.as_str() {
+                "alert" => text.clone(),
+                _ => BotPermissions::default(),
+            };
+            assert_eq!(command.permissions, expected, "/{}", command.name);
         }
-        let autonomous = definition.autonomous_config.unwrap().permissions;
-        assert_eq!(
-            autonomous,
-            BotPermissions::default().with_message(&HashSet::from([MessagePermission::Text]))
-        );
+        assert_eq!(definition.autonomous_config.unwrap().permissions, text);
     }
 }
