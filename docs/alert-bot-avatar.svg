@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="area" x1="0" y1="196" x2="0" y2="420" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3987e5" stop-opacity="0.38"/>
+      <stop offset="1" stop-color="#3987e5" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="glow">
+      <stop offset="0" stop-color="#c98500" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#c98500" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" fill="#1a1a19"/>
+  <g stroke="#2c2c2a" stroke-width="6" stroke-linecap="round">
+    <line x1="96" y1="176" x2="416" y2="176"/>
+    <line x1="96" y1="336" x2="416" y2="336"/>
+  </g>
+  <path d="M98 372 L172 312 L224 344 L300 262 L372 196 L372 420 L98 420 Z" fill="url(#area)"/>
+  <line x1="72" y1="256" x2="440" y2="256" stroke="#c98500" stroke-width="16" stroke-dasharray="34 22" stroke-linecap="round"/>
+  <path d="M98 372 L172 312 L224 344 L300 262 L372 196" fill="none" stroke="#3987e5" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="372" cy="196" r="72" fill="url(#glow)"/>
+  <circle cx="372" cy="196" r="38" fill="#c98500"/>
+  <circle cx="372" cy="196" r="14" fill="#f0efec"/>
+</svg>

@@ -265,7 +265,9 @@ It's a long-running server, so the prices it caches are shared between requests.
    Give it the avatar [`docs/avatar.png`](./docs/avatar.png), drawn from
    [`docs/avatar.svg`](./docs/avatar.svg) in the charts' colours.
    - Register PriceAlertBot the same way, with its own identity's principal, and an endpoint which
-     maps to the service's `/alerts`.
+     maps to the service's `/alerts`. Give it the avatar
+     [`docs/alert-bot-avatar.png`](./docs/alert-bot-avatar.png), drawn from
+     [`docs/alert-bot-avatar.svg`](./docs/alert-bot-avatar.svg): ChartBot's line, crossing a target.
 
 4. **Install it** in a group, community or direct chat, granting it the permission to send text
    and image messages.
@@ -392,7 +394,8 @@ managed through SSM.
 9. **Deploy it,** as below.
 10. **Register ChartBot** on OpenChat, with the distribution's url as its endpoint. Then build the
     website with `OC_PRICE_SERVICE_URL` set to the same url.
-11. **Register PriceAlertBot**, with its distribution's url as its endpoint.
+11. **Register PriceAlertBot**, with its distribution's url as its endpoint and the avatar
+    [`docs/alert-bot-avatar.png`](./docs/alert-bot-avatar.png).
 
 **Deploys** are done by the *Deploy* GitHub Actions workflow,
 [`deploy.yaml`](./.github/workflows/deploy.yaml), run by hand from `main`:
