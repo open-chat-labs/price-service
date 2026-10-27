@@ -161,16 +161,16 @@ a bot of its own, with its own identity, served by the same container as ChartBo
 prices. The code is in [`src/alert_bot`](./src/alert_bot).
 
 - `/alert CHAT above 0.05` sets an alert, which the bot confirms in the chat, eg. "I'll reply here
-  when CHAT goes above $0.05. It's $0.0295 now." An alert that's already met, eg. CHAT above $0.05
+  when CHAT goes above $0.05. It's now $0.0295." An alert that's already met, eg. CHAT above $0.05
   when it's $0.06, is refused, and only whoever tried to set it is told. Deleting the confirmation
   cancels the alert.
 - `/alerts` lists your alerts in the chat, numbered, each with its token's price now. Only you see
   it.
 - `/remove_alert 2` removes the second, and strikes out its confirmation, eg. "~~I'll reply here
-  when CHAT goes above $0.05. It's $0.0295 now.~~".
+  when CHAT goes above $0.05. It's now $0.0295.~~".
 
 When a price reaches its target, the bot replies to the alert's confirmation, eg. "CHAT is above
-$0.05: it's $0.0512 now.", in the chat or the thread the alert was set in, and removes the alert, so
+$0.05: it's now $0.0512.", in the chat or the thread the alert was set in, and removes the alert, so
 it fires once.
 
 - **Tokens:** those the price API has, ie. the tokens OpenChat lists and the 250 largest coins,
