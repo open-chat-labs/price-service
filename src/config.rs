@@ -66,12 +66,12 @@ impl Config {
     }
 }
 
-// A PEM given as text, or in a file
+// A PEM given as text, or in a file. An empty file is none, so the host can always mount one.
 fn pem(text_var: &str, file_var: &str) -> Result<Option<String>> {
     match (var(text_var), var(file_var)) {
         (Some(pem), _) => Ok(Some(pem)),
         (None, Some(file)) => std::fs::read_to_string(&file)
-            .map(Some)
+            .map(|pem| Some(pem).filter(|pem| !pem.trim().is_empty()))
             .with_context(|| format!("Failed to read {file_var} {file}")),
         (None, None) => Ok(None),
     }

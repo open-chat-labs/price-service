@@ -1,7 +1,9 @@
 #!/bin/bash
 # Run by oc-price-service.service before each start, as root: pulls the image from ECR, and writes
-# the config from SSM Parameter Store's /oc-price-service/* to /run/oc-price-service. The identity
-# goes to its own file, as a PEM spans lines, and everything else to an env file, one line each.
+# the config from SSM Parameter Store's /oc-price-service/* to /run/oc-price-service. Each bot's
+# identity goes to its own file, as a PEM spans lines, and everything else to an env file, one line
+# each. PriceAlertBot's identity is optional: without it, its file is empty, which turns it off.
+# Its alerts are kept in /var/lib/oc-price-service, which outlasts restarts and deploys.
 set -euo pipefail
 
 image=$1
@@ -10,20 +12,23 @@ dir=/run/oc-price-service
 aws ecr get-login-password | docker login --username AWS --password-stdin "${image%%/*}"
 docker pull "$image"
 
-# The container runs as nobody, who reads the identity
+# The container runs as nobody, who reads the identities and keeps the alerts
 install -d -m 0700 -o nobody -g nobody "$dir"
+install -d -m 0700 -o nobody -g nobody /var/lib/oc-price-service
 umask 077
 : > "$dir/env"
+: > "$dir/alert-bot-identity.pem"
 # Without a trailing slash, as the instance's role is allowed to list the path as written here
 names=$(aws ssm get-parameters-by-path --path /oc-price-service --query 'Parameters[].Name' --output text)
 for name in $names; do
     value=$(aws ssm get-parameter --name "$name" --with-decryption --query Parameter.Value --output text)
     case "${name##*/}" in
         OC_IDENTITY_PEM) printf '%s\n' "$value" > "$dir/identity.pem" ;;
+        ALERT_BOT_IDENTITY_PEM) printf '%s\n' "$value" > "$dir/alert-bot-identity.pem" ;;
         # Only the deploy reads it
         PUBLIC_URL) ;;
         *) printf '%s=%s\n' "${name##*/}" "$value" >> "$dir/env" ;;
     esac
 done
 [ -s "$dir/identity.pem" ] || { echo "/oc-price-service/OC_IDENTITY_PEM isn't set"; exit 1; }
-chown nobody:nobody "$dir/identity.pem"
+chown nobody:nobody "$dir/identity.pem" "$dir/alert-bot-identity.pem"

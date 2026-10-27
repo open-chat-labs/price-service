@@ -6,6 +6,8 @@ memory, so it asks the price APIs once however many people want a price. It serv
 - **[The price API](#price-api)**, which OpenChat's website reads every USD value from, and cashtags'
   charts (`$CHAT` in a message), for the tokens OpenChat lists and the largest other coins, eg. ADA.
 - **[ChartBot](#chartbot)**, an OpenChat bot which replies to `/chart` with a price chart.
+- **[PriceAlertBot](#pricealertbot)**, an OpenChat bot which tells you in a chat when a token's
+  price goes above or below one you gave, eg. `/alert CHAT above 0.05`.
 
 ## Price API
 
@@ -152,6 +154,45 @@ API in [`src/api.rs`](./src/api.rs), and the bot in [`src/chart_bot`](./src/char
   - ICPSwap's charts are slow, often 3-20 seconds. So the service makes at most 4 requests to
     ICPSwap at once, and tries again once if it's refused for too many.
 
+## PriceAlertBot
+
+Tells you, in the chat where you asked, when a token's price goes above or below one you gave. It's
+a bot of its own, with its own identity, served by the same container as ChartBot, from the same
+prices. The code is in [`src/alert_bot`](./src/alert_bot).
+
+- `/alert CHAT above 0.05` sets an alert. The bot tells only you that it's set, with CHAT's price
+  now. An alert that's already met, eg. CHAT above $0.05 when it's $0.06, is refused.
+- `/alerts` lists your alerts in the chat, numbered, each with its token's price now.
+- `/remove_alert 2` removes the second.
+
+When a price reaches its target, the bot posts in the chat, eg. "@alice CHAT is above $0.05: it's
+$0.0512 now.", and removes the alert, so it fires once.
+
+- **Tokens:** those the price API has, ie. the tokens OpenChat lists and the 250 largest coins,
+  matched by symbol as ChartBot matches them. A leading `$` on the symbol or the price is ignored,
+  and `above` can be `over` or `>`, and `below` `under` or `<`. Like `/chart`, `/alert` has a single
+  string parameter, which the bot splits into the three.
+- **Checking:** each time the prices refresh, so every minute for OpenChat's tokens, from ICPSwap,
+  and every 6 minutes for the coins, from CoinGecko. A price that crosses a target and comes back
+  between two refreshes isn't caught.
+- **Where:** groups and community channels. Its commands only reply to whoever ran them, so need no
+  permissions. Posting the alerts needs one, to send text messages without a command, which OpenChat
+  asks for when it's installed.
+- **Limits:** 20 alerts per person per chat.
+- **Storage:** the alerts are kept in a JSON file, `ALERTS_FILE`, rewritten on each change, so they
+  outlast restarts and deploys. On AWS it's on the host, in `/var/lib/oc-price-service`.
+- **Clearing up:** when the bot's uninstalled from a chat, OpenChat tells it, at `/notify`, and its
+  alerts there are dropped. An alert OpenChat won't post, eg. as the bot can no longer post in the
+  chat, is dropped too, rather than tried again each minute. One that couldn't reach OpenChat is
+  tried again at the next refresh.
+- **Mentions:** the post mentions whoever set the alert, which OpenChat shows as their @username. But
+  OpenChat doesn't yet pass a bot's mentions on (`c2c_bot_send_message` sends none), so it doesn't
+  notify them as a person's mention would.
+- **Its own endpoint:** OpenChat registers a bot only at an origin, eg. `https://example.com` but not
+  `https://example.com/alerts`. So PriceAlertBot is served under `/alerts`, and given an origin of
+  its own which maps to it: on AWS a CloudFront distribution of its own, and locally a port of its
+  own, `ALERT_BOT_PORT`.
+
 ## Running it
 
 It's a long-running server, so the prices it caches are shared between requests.
@@ -174,6 +215,9 @@ It's a long-running server, so the prices it caches are shared between requests.
    dfx identity export chart_bot
    ```
 
+   PriceAlertBot needs an identity of its own, eg. `price_alert_bot`, which the service takes as
+   `ALERT_BOT_IDENTITY_PEM`. Without one, PriceAlertBot is off.
+
 2. **Run it:**
 
    ```bash
@@ -194,9 +238,13 @@ It's a long-running server, so the prices it caches are shared between requests.
    as its endpoint and the identity's principal. OpenChat reads its definition from the endpoint.
    Give it the avatar [`docs/avatar.png`](./docs/avatar.png), drawn from
    [`docs/avatar.svg`](./docs/avatar.svg) in the charts' colours.
+   - Register PriceAlertBot the same way, with its own identity's principal, and an endpoint which
+     maps to the service's `/alerts`.
 
 4. **Install it** in a group, community or direct chat, granting it the permission to send text
    and image messages.
+   - Install PriceAlertBot in a group or community, granting it the permission to send text
+     messages.
 
 ### Locally
 
@@ -207,9 +255,13 @@ With OpenChat running locally from a checkout of
 ./scripts/run_local.sh
 ```
 
-It makes a `chart_bot` identity if there isn't one, and prints the bot's principal and endpoint to
-register it with. It reads the local StorageIndex's id from the `open-chat` checkout, or from the
-checkout `OPEN_CHAT_DIR` names.
+It makes `chart_bot` and `price_alert_bot` identities if there aren't any, and prints each bot's
+principal and endpoint to register it with: ChartBot's on port 3002, and PriceAlertBot's on 3003. It
+reads the local StorageIndex's id from the `open-chat` checkout, or from the checkout
+`OPEN_CHAT_DIR` names. The alerts are kept in `target/local-price-alerts.json`.
+
+To see an alert fire, set one, then run the script again with a token priced as another, eg.
+`LEDGER_ALIASES=<local CHAT>=ryjl3-tyaaa-aaaaa-aaaba-cai` prices CHAT as ICP.
 
 ### On AWS
 
@@ -222,6 +274,9 @@ managed through SSM.
 - **Its own distribution:** OpenChat reads a bot's definition from its endpoint's root, so ChartBot
   can't share a distribution with the bridges.
 - **Its url:** `https://d2r0806cxz8193.cloudfront.net`, the distribution `E2LYK4LO2EO26X`.
+- **PriceAlertBot** has a distribution of its own, which maps its root to the service's `/alerts`.
+- **The alerts** are kept on the instance, in `/var/lib/oc-price-service`. They outlast restarts
+  and deploys, but not replacing the instance, unless that directory's copied over.
 
 **To set it up**, once:
 
@@ -232,10 +287,13 @@ managed through SSM.
    - `/oc-price-service/COINGECKO_API_KEY`: a SecureString, a CoinGecko Demo key.
    - `/oc-price-service/PUBLIC_URL`: a String, the CloudFront distribution's url, which the deploy
      checks.
+   - `/oc-price-service/ALERT_BOT_IDENTITY_PEM`: a SecureString, PriceAlertBot's identity, from
+     `dfx identity export price_alert_bot`. Without it, PriceAlertBot is off.
    - Any other variable under [Configuration](#configuration) can be added the same way.
 
-   [`scripts/set_aws_params.sh`](./scripts/set_aws_params.sh) sets the three. It takes the identity
-   from dfx and asks for the key. Pass it the url once the distribution exists:
+   [`scripts/set_aws_params.sh`](./scripts/set_aws_params.sh) sets them. It takes the identities
+   from dfx, leaving PriceAlertBot's out if there's no `price_alert_bot` identity, and asks for the
+   key. Pass it the url once the distribution exists:
 
    ```bash
    ./scripts/set_aws_params.sh https://<distribution>.cloudfront.net
@@ -264,7 +322,10 @@ managed through SSM.
    It starts on the first deploy, once there's an image. Each time it starts, it:
    - pulls `oc-price-service:latest`;
    - writes the config to `/run/oc-price-service`;
-   - runs the container on port 8082, as `nobody`, with its logs going to CloudWatch.
+   - runs the container on port 8082, as `nobody`, with its logs going to CloudWatch, and
+     `/var/lib/oc-price-service` mounted for the alerts.
+
+   Install them again whenever they change, eg. PriceAlertBot needed both changed.
 
    If it stops, it's restarted after 30 seconds. After 5 starts in an hour it's left stopped, as each
    start calls CoinGecko.
@@ -285,6 +346,8 @@ managed through SSM.
    - **Viewers:** HTTPS only, as for the bridges.
    - **Edge locations:** all of them, as the website's users are worldwide. The bridges' use only
      North America's and Europe's.
+   - **PriceAlertBot's distribution** is the same, with the same origin given the origin path
+     `/alerts`, and only the default behaviour, ChartBot's.
 8. **The deploy role,** `GitHubActions-DeployPriceService`, which GitHub can assume only from `main`:
    - **Trust:** the OIDC provider `token.actions.githubusercontent.com`, with `aud`
      `sts.amazonaws.com` and `sub`
@@ -302,6 +365,7 @@ managed through SSM.
 9. **Deploy it,** as below.
 10. **Register ChartBot** on OpenChat, with the distribution's url as its endpoint. Then build the
     website with `OC_PRICE_SERVICE_URL` set to the same url.
+11. **Register PriceAlertBot**, with its distribution's url as its endpoint.
 
 **Deploys** are done by the *Deploy* GitHub Actions workflow,
 [`deploy.yaml`](./.github/workflows/deploy.yaml), run by hand from `main`:
@@ -317,11 +381,14 @@ managed through SSM.
 
 | Variable | |
 |---|---|
-| `OC_IDENTITY_PEM` or `OC_IDENTITY_PEM_FILE` | The bot's identity, as PEM text, eg. from `dfx identity export`, or a file |
+| `OC_IDENTITY_PEM` or `OC_IDENTITY_PEM_FILE` | ChartBot's identity, as PEM text, eg. from `dfx identity export`, or a file |
+| `ALERT_BOT_IDENTITY_PEM` or `ALERT_BOT_IDENTITY_PEM_FILE` | PriceAlertBot's identity, the same way. Without one, or with an empty file, PriceAlertBot is off |
+| `ALERTS_FILE` | Where PriceAlertBot keeps its alerts. Defaults to `price-alerts.json` |
 | `COINGECKO_API_KEY` | Optional, but worth having in production. A CoinGecko Demo API key, which is free, for a higher rate limit than its public API's. The coins' refresh uses about 7,200 of its 10,000 calls a month. Its prices must be credited where they're shown, which the API's `sources` says. |
 | `PORT` | Defaults to 3000, or 8080 in the container |
 | `OC_IC_URL`, `OC_PUBLIC_KEY`, `OC_STORAGE_INDEX` | Only to use an OpenChat other than mainnet's |
 | `LEDGER_ALIASES` | Only locally: `local=mainnet` ledger pairs, separated by commas, to price local ledgers as mainnet ones |
+| `ALERT_BOT_PORT` | Only locally: a port to serve PriceAlertBot on as well, at its root, as an origin of its own |
 | `RUST_LOG` | Log level, eg. `info` (the default) |
 
 ## Development
