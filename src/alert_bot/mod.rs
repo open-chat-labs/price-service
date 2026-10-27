@@ -14,7 +14,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use oc_bots_sdk::api::command::{
-    CommandHandler, CommandHandlerRegistry, EphemeralMessageBuilder, Message, SuccessResult,
+    CommandHandler, CommandHandlerRegistry, EphemeralMessageBuilder, SuccessResult,
 };
 use oc_bots_sdk::api::definition::{
     AutonomousConfig, BotCommandDefinition, BotCommandParam, BotCommandParamType, BotDefinition,
@@ -112,6 +112,11 @@ pub fn spawn_checker(
             // An alert no longer met, or removed, starts afresh if it fails again
             failing_since.retain(|id, _| met.iter().any(|(alert, _)| alert.id == *id));
             for (alert, price) in met {
+                // It may have gone since the check, eg. as its confirmation was deleted while
+                // others were posted
+                if !alerts.contains(alert.id) {
+                    continue;
+                }
                 let posted = post_alert(&client_factory, &alert, price).await;
                 if is_done(&alert, posted, &mut failing_since, now) {
                     alerts.remove(alert.id);
@@ -300,19 +305,31 @@ impl CommandHandler<AgentRuntime> for SetAlert {
         &self,
         oc_client: Client<AgentRuntime, BotCommandContext>,
     ) -> Result<SuccessResult, String> {
-        let context = oc_client.context();
+        let context = oc_client.context().clone();
         let text: String = context.command.maybe_arg("alert").unwrap_or_default();
+        let state = self.0.clone();
         let result = async {
             let args = args::parse(&text)?;
-            let (alert, price) = self.alert(context, args).await?;
-            self.set(&oc_client, alert, price).await
+            let (alert, price) = self.alert(&context, args).await?;
+            // In a task of its own, so that it's seen through even if the request's dropped, eg. as
+            // the person closed OpenChat mid-way, which would leave the alert awaiting confirmation
+            tokio::spawn(async move {
+                set(&state.alerts, alert, price, |text| {
+                    oc_client
+                        .send_message(MessageContentInitial::from_text(text))
+                        .execute_async_then_return_message()
+                })
+                .await
+            })
+            .await
+            .unwrap_or_else(|e| Err(internal("Failed to set an alert", e)))
         }
         .await;
         match result {
             Ok(confirmation) => Ok(SuccessResult {
                 message: Some(confirmation),
             }),
-            Err(refusal) => privately(context, refusal),
+            Err(refusal) => privately(&context, refusal),
         }
     }
 }
@@ -350,6 +367,7 @@ impl SetAlert {
             user: context.command.initiator,
             chat,
             thread: context.scope.thread(),
+            confirmation_id: context.message_id(),
             confirmation: None,
             api_gateway: context.api_gateway,
             symbol: token.symbol,
@@ -360,45 +378,43 @@ impl SetAlert {
         };
         Ok((alert, price))
     }
+}
 
-    // Saves the alert, then confirms it in the chat, noting the confirmation for the alert to reply
-    // to. It's saved first, so a confirmation is never posted for an alert that can't be kept, and
-    // removed again if the confirmation can't be posted. It isn't checked until it's confirmed.
-    async fn set(
-        &self,
-        oc_client: &Client<AgentRuntime, BotCommandContext>,
-        alert: Alert,
-        price: f64,
-    ) -> Result<Message, String> {
-        let alerts = &self.0.alerts;
-        let alert = match alerts.add(alert) {
-            Ok(Some(alert)) => alert,
-            Ok(None) => {
-                return Err(format!(
-                    "You have {MAX_PER_USER_PER_CHAT} alerts in this chat, the most you can. \
-                    Remove one with /remove_alert."
-                ));
-            }
-            Err(e) => return Err(internal("Failed to save an alert", e)),
-        };
+// Saves the alert, then confirms it in the chat with `send`, noting the confirmation for the alert to
+// reply to. It's saved first, so a confirmation is never posted for an alert that can't be kept, and
+// removed again if the confirmation can't be posted. It isn't checked until it's confirmed.
+async fn set<M, E, F>(
+    alerts: &Alerts,
+    alert: Alert,
+    price: f64,
+    send: impl FnOnce(String) -> F,
+) -> Result<M, String>
+where
+    E: std::fmt::Debug,
+    F: Future<Output = (Option<M>, Result<send_message::Response, E>)>,
+{
+    let alert = match alerts.add(alert) {
+        Ok(Some(alert)) => alert,
+        Ok(None) => {
+            return Err(format!(
+                "You have {MAX_PER_USER_PER_CHAT} alerts in this chat, the most you can. Remove \
+                one with /remove_alert."
+            ));
+        }
+        Err(e) => return Err(internal("Failed to save an alert", e)),
+    };
 
-        let (message, response) = oc_client
-            .send_message(MessageContentInitial::from_text(confirmation(
-                &alert, price,
-            )))
-            .execute_async_then_return_message()
-            .await;
-        match (message, confirmed_at(response)) {
-            (Some(message), Ok(confirmation)) => {
-                alerts.confirmed(alert.id, confirmation);
-                Ok(message)
-            }
-            (_, result) => {
-                alerts.remove(alert.id);
-                Err(result
-                    .err()
-                    .unwrap_or_else(|| SOMETHING_WENT_WRONG.to_string()))
-            }
+    let (message, response) = send(confirmation(&alert, price)).await;
+    match (message, confirmed_at(response)) {
+        (Some(message), Ok(confirmation)) => {
+            alerts.confirmed(alert.id, confirmation);
+            Ok(message)
+        }
+        (_, result) => {
+            alerts.remove(alert.id);
+            Err(result
+                .err()
+                .unwrap_or_else(|| SOMETHING_WENT_WRONG.to_string()))
         }
     }
 }
@@ -619,11 +635,8 @@ fn notified(alerts: &Alerts, notification: BotEventWrapper) {
         BotEvent::Chat(chat_event) => {
             if let ChatEvent::Message(message) = &chat_event.event
                 && matches!(message.content, MessageContent::Deleted(_))
-                && let Some(alert) = alerts.remove_confirmed(
-                    chat_event.chat,
-                    chat_event.thread,
-                    chat_event.event_index,
-                )
+                && let Some(alert) =
+                    alerts.remove_confirmed(chat_event.chat, chat_event.thread, message.message_id)
             {
                 info!(
                     id = alert.id,
@@ -670,6 +683,7 @@ mod tests {
             user: id(1),
             chat: Chat::Group(id(2)),
             thread: None,
+            confirmation_id: None,
             confirmation: None,
             api_gateway: id(3),
             symbol: symbol.to_string(),
@@ -919,13 +933,13 @@ mod tests {
         }
     }
 
-    fn message_event(content: MessageContent, event_index: EventIndex) -> BotEventWrapper {
+    fn message_event(content: MessageContent, message_id: u64) -> BotEventWrapper {
         BotEventWrapper {
             api_gateway: id(3),
             event: BotEvent::Chat(BotChatEvent {
                 event: ChatEvent::Message(Box::new(oc_bots_sdk::types::Message {
                     message_index: 4,
-                    message_id: 5.into(),
+                    message_id: message_id.into(),
                     sender: id(9),
                     content,
                     sender_context: None,
@@ -940,8 +954,8 @@ mod tests {
                 })),
                 chat: Chat::Group(id(2)),
                 thread: None,
-                event_index,
-                latest_event_index: event_index,
+                event_index: 7,
+                latest_event_index: 7,
             }),
             timestamp: 1000,
             notification_index: 1,
@@ -952,7 +966,10 @@ mod tests {
     fn deleting_a_confirmation_cancels_its_alert() {
         let alerts = Alerts::load(None).unwrap();
         let alert = alerts
-            .add(alert("CHAT", Direction::Above, 0.05))
+            .add(Alert {
+                confirmation_id: Some(70.into()),
+                ..alert("CHAT", Direction::Above, 0.05)
+            })
             .unwrap()
             .unwrap();
         alerts.confirmed(alert.id, 7);
@@ -964,15 +981,45 @@ mod tests {
         };
 
         // Another message deleted, or the confirmation restored, leaves it be
-        notified(&alerts, message_event(deleted(), 8));
+        notified(&alerts, message_event(deleted(), 71));
         let restored = MessageContent::Text(TextContent {
             text: "I'll reply here".to_string(),
         });
-        notified(&alerts, message_event(restored, 7));
+        notified(&alerts, message_event(restored, 70));
         assert_eq!(alerts.all().len(), 1);
 
-        notified(&alerts, message_event(deleted(), 7));
+        notified(&alerts, message_event(deleted(), 70));
         assert!(alerts.all().is_empty());
+    }
+
+    type Sent = (Option<&'static str>, Result<send_message::Response, ()>);
+
+    #[tokio::test]
+    async fn an_alert_is_kept_once_confirmed_and_dropped_if_it_cant_be() {
+        let alerts = Alerts::load(None).unwrap();
+        let alert = || alert("CHAT", Direction::Above, 0.05);
+        let set = |sent: Sent| set(&alerts, alert(), 0.0295, move |_| async move { sent });
+
+        assert_eq!(
+            set((Some("confirmation"), sent())).await,
+            Ok("confirmation")
+        );
+        let kept = alerts.checkable();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].confirmation, Some(1));
+
+        let rules = set((
+            Some("confirmation"),
+            refused(OCErrorCode::ChatRulesNotAccepted),
+        ))
+        .await;
+        assert!(rules.unwrap_err().contains("accept this chat's rules"));
+        assert_eq!(
+            set((None, sent())).await,
+            Err(SOMETHING_WENT_WRONG.to_string())
+        );
+        assert_eq!(alerts.all(), kept);
+        assert!(alerts.none_confirming());
     }
 
     #[test]

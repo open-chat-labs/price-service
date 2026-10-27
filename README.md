@@ -203,9 +203,11 @@ it fires once.
   its response. Until that's live, the reply notifies nobody.
 - **Confirming:** the confirmation's posted as a command's response, so whoever set the alert must
   have accepted the chat's rules, which they're asked to do if they haven't. An alert isn't checked
-  until its confirmation's posted. If the service stops in between, the alert fires without a reply
-  after a restart, mentioning them instead.
-- **A deleted confirmation** cancels its alert: OpenChat tells a bot when its own message is deleted.
+  until its confirmation's posted, which carries on if the request's dropped, eg. as they closed
+  OpenChat. If the service stops in between, the alert fires without a reply after a restart,
+  mentioning them instead.
+- **A deleted confirmation** cancels its alert, recognised by the confirmation's message id: OpenChat
+  tells a bot when its own message is deleted.
   Until that OpenChat change is live, the alert fires anyway, as a reply to the deleted message.
   Restoring the confirmation doesn't restore the alert.
 - **Disappearing messages:** in a chat where they disappear, an alert that fires after its
