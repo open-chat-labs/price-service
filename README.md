@@ -200,8 +200,9 @@ it fires once.
   rather than mentions them, as OpenChat doesn't pass a bot's mentions on (`c2c_bot_send_message`
   sends none). An OpenChat change on its way notifies whoever ran a command when a bot replies to
   its response. Until that's live, the reply notifies nobody.
-- **A deleted confirmation:** the alert still replies to it, quoting a deleted message. The bot can't
-  tell it's been deleted, as reading a chat's messages needs a permission it doesn't ask for.
+- **A deleted confirmation:** an alert whose confirmation was deleted is posted as a reply to the
+  deleted message, which quotes it as deleted. A deleted message keeps who it was for, so the reply
+  still notifies whoever set the alert, once OpenChat's change is live.
 - **Its own endpoint:** OpenChat registers a bot only at an origin, eg. `https://example.com` but not
   `https://example.com/alerts`. So PriceAlertBot is served under `/alerts`, and given an origin of
   its own which maps to it: on AWS a CloudFront distribution of its own, and locally a port of its
