@@ -186,8 +186,9 @@ it fires once.
   command, for the alerts and to strike out a removed alert's confirmation. OpenChat asks for both
   when it's installed. `/alerts` and `/remove_alert` only reply to whoever ran them, so need none.
 - **Striking out:** the bot edits a removed alert's confirmation on its own, as OpenChat only lets a
-  bot edit its messages that way. A confirmation still being posted when its alert's removed is left
-  as it is.
+  bot edit its messages that way. A failed edit isn't tried again, eg. one that reached OpenChat
+  before the confirmation it strikes out. Alerts set before the bot kept their confirmations' text
+  are left as they are.
 - **Limits:** 20 alerts per person per chat.
 - **Storage:** the alerts are kept in a JSON file, `ALERTS_FILE`, rewritten on each change, so they
   outlast restarts and deploys. On AWS it's on the host, in `/var/lib/oc-price-service`.

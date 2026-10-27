@@ -618,6 +618,10 @@ async fn strike_out(client_factory: Arc<ClientFactory<AgentRuntime>>, alert: Ale
         .await;
     match response {
         Ok(UnitResult::Success) => info!(id = alert.id, "Struck out a removed alert"),
+        // eg. as it was deleted, or disappeared, or hadn't been posted yet
+        Ok(UnitResult::Error(e)) if e.matches_code(OCErrorCode::MessageNotFound) => {
+            info!(id = alert.id, "A removed alert's confirmation was gone")
+        }
         response => warn!(
             id = alert.id,
             ?response,
@@ -627,17 +631,14 @@ async fn strike_out(client_factory: Arc<ClientFactory<AgentRuntime>>, alert: Ale
 }
 
 // The removed alert's confirmation, and its text struck out, eg. "~~I'll reply here when CHAT goes
-// above $0.05. It's $0.0295 now.~~". One that wasn't posted, or was saved before its text was kept,
-// is left as it is.
+// above $0.05. It's $0.0295 now.~~". It's tried even if the confirmation's posting wasn't noted, eg.
+// as the service restarted in between, since an edit can only reach the bot's own message with that
+// id. One saved before its text was kept is left as it is.
 fn struck_out(alert: &Alert) -> Option<(MessageId, String)> {
-    let (Some(_), Some(message_id), Some(text)) = (
-        alert.confirmation,
-        alert.confirmation_id,
-        &alert.confirmation_text,
-    ) else {
-        return None;
-    };
-    Some((message_id, format!("~~{text}~~")))
+    Some((
+        alert.confirmation_id?,
+        format!("~~{}~~", alert.confirmation_text.as_deref()?),
+    ))
 }
 
 // A reply only whoever ran the command sees
@@ -814,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_alerts_confirmation_is_struck_out_once_posted() {
+    fn a_removed_alerts_confirmation_is_struck_out() {
         let text = "I'll reply here when CHAT goes above $0.05. It's $0.0295 now.";
         let confirmed = Alert {
             confirmation_id: Some(70.into()),
@@ -827,12 +828,12 @@ mod tests {
             Some((70.into(), format!("~~{text}~~")))
         );
 
-        // Not while it's being posted, nor if its text wasn't kept
-        let posting = Alert {
+        // Even if its posting wasn't noted, but not if its text wasn't kept
+        let unnoted = Alert {
             confirmation: None,
             ..confirmed.clone()
         };
-        assert_eq!(struck_out(&posting), None);
+        assert_eq!(struck_out(&unnoted), struck_out(&confirmed));
         let saved_before = Alert {
             confirmation_text: None,
             ..confirmed
