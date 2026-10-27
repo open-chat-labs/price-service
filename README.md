@@ -196,7 +196,9 @@ it fires once.
   longer post in the chat, is dropped too, rather than tried again each minute.
 - **Retries:** an alert that couldn't reach OpenChat, or the chat's canister, eg. while it's
   upgraded, is tried again at each refresh, for up to a day. Deleting a group doesn't tell its
-  bots, so its alerts go then.
+  bots, so its alerts go then. Each attempt uses the alert's own message id, kept with it, so if
+  OpenChat posted one but its answer was lost, the next is refused as a duplicate rather than
+  posted twice, and the alert's taken as posted.
 - **Who's told:** the alert replies to the confirmation, which shows whose alert it is. It replies
   rather than mentions them, as OpenChat doesn't pass a bot's mentions on (`c2c_bot_send_message`
   sends none). An OpenChat change on its way notifies whoever ran a command when a bot replies to

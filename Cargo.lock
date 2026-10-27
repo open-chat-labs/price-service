@@ -2000,6 +2000,7 @@ dependencies = [
  "oc_bots_sdk",
  "oc_bots_sdk_offchain",
  "plotters",
+ "rand",
  "reqwest",
  "resvg",
  "serde",

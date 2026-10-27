@@ -168,6 +168,7 @@ async fn post_alert(
     });
     let response = client
         .send_message(MessageContentInitial::from_text(fired(alert, price)))
+        .with_message_id(alert.post_id)
         .in_thread(alert.thread)
         .replies_to(alert.confirmation)
         .execute_async()
@@ -183,10 +184,16 @@ async fn post_alert(
     posted
 }
 
-// OpenChat answers C2CError when it couldn't reach the chat's canister, eg. as it was being upgraded
+// OpenChat answers C2CError when it couldn't reach the chat's canister, eg. as it was being upgraded,
+// and MessageIdAlreadyExists when an earlier attempt was posted, though its answer was lost
 fn posted<E>(response: &Result<send_message::Response, E>) -> Posted {
     match response {
         Ok(send_message::Response::Success(_)) => Posted::Yes,
+        Ok(send_message::Response::Error(e))
+            if e.matches_code(OCErrorCode::MessageIdAlreadyExists) =>
+        {
+            Posted::Yes
+        }
         Ok(send_message::Response::Error(e)) if !e.matches_code(OCErrorCode::C2CError) => {
             Posted::Refused
         }
@@ -369,6 +376,7 @@ impl SetAlert {
             thread: context.scope.thread(),
             confirmation_id: context.message_id(),
             confirmation: None,
+            post_id: store::new_message_id(),
             api_gateway: context.api_gateway,
             symbol: token.symbol,
             source: token.source,
@@ -685,6 +693,7 @@ mod tests {
             thread: None,
             confirmation_id: None,
             confirmation: None,
+            post_id: 1.into(),
             api_gateway: id(3),
             symbol: symbol.to_string(),
             source: Source::CoinGecko(symbol.to_lowercase()),
@@ -823,6 +832,11 @@ mod tests {
         );
         // eg. the chat's canister was being upgraded
         assert_eq!(posted(&refused(OCErrorCode::C2CError)), Posted::Failed);
+        // An earlier attempt, with the same message id, was posted though its answer was lost
+        assert_eq!(
+            posted(&refused(OCErrorCode::MessageIdAlreadyExists)),
+            Posted::Yes
+        );
         assert_eq!(posted::<()>(&Err(())), Posted::Failed);
     }
 

@@ -58,6 +58,10 @@ pub struct Alert {
     /// it fires
     #[serde(default)]
     pub confirmation: Option<EventIndex>,
+    /// The id the alert's posted with when it fires, the same at every attempt, so that one which
+    /// OpenChat took, though its answer was lost, isn't posted again
+    #[serde(default = "new_message_id")]
+    pub post_id: MessageId,
     /// The canister the bot posts in the chat through
     pub api_gateway: CanisterId,
     pub symbol: String,
@@ -268,6 +272,11 @@ impl Alerts {
     }
 }
 
+/// A message id of the bot's own choosing, at random as OpenChat's are
+pub fn new_message_id() -> MessageId {
+    rand::random::<u64>().into()
+}
+
 // Written to a temporary file, flushed to disk, then renamed over the old one, so a crash or a
 // power cut mid-write leaves the old alerts rather than half the new ones
 fn write(file: &Path, saved: &Saved) -> Result<()> {
@@ -304,6 +313,7 @@ mod tests {
             thread: None,
             confirmation_id: None,
             confirmation: None,
+            post_id: 1.into(),
             api_gateway: id(100),
             symbol: "CHAT".to_string(),
             source: Source::Icp(id(200)),
@@ -509,6 +519,17 @@ mod tests {
         alerts.add(alert(1, group())).unwrap();
         assert_eq!(Alerts::load(Some(file)).unwrap().all().len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_alert_saved_before_it_had_a_post_id_is_given_one() {
+        let mut saved = serde_json::to_value(alert(1, group())).unwrap();
+        saved.as_object_mut().unwrap().remove("post_id");
+
+        let a: Alert = serde_json::from_value(saved.clone()).unwrap();
+        let b: Alert = serde_json::from_value(saved).unwrap();
+
+        assert_ne!(a.post_id, b.post_id);
     }
 
     #[test]
