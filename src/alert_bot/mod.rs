@@ -225,12 +225,12 @@ fn is_done(
     true
 }
 
-// eg. "CHAT is above $0.05: it's $0.0512 now.", replying to the alert's confirmation, which shows
+// eg. "CHAT is above $0.05: it's now $0.0512.", replying to the alert's confirmation, which shows
 // whose it is. Without one, eg. as the service stopped before it could note it, it mentions them,
 // which OpenChat shows as their username, though it doesn't notify them.
 fn fired(alert: &Alert, price: f64) -> String {
     let text = format!(
-        "{} is {} {}: it's {} now.",
+        "{} is {} {}: it's now {}.",
         alert.symbol,
         alert.direction.word(),
         target_usd(alert.target),
@@ -455,10 +455,10 @@ fn confirmed_at<E: std::fmt::Debug>(
     }
 }
 
-// eg. "I'll reply here when CHAT goes above $0.05. It's $0.0295 now."
+// eg. "I'll reply here when CHAT goes above $0.05. It's now $0.0295."
 fn confirmation(alert: &Alert, price: f64) -> String {
     format!(
-        "I'll reply here when {} goes {} {}. It's {} now.",
+        "I'll reply here when {} goes {} {}. It's now {}.",
         alert.symbol,
         alert.direction.word(),
         target_usd(alert.target),
@@ -631,7 +631,7 @@ async fn strike_out(client_factory: Arc<ClientFactory<AgentRuntime>>, alert: Ale
 }
 
 // The removed alert's confirmation, and its text struck out, eg. "~~I'll reply here when CHAT goes
-// above $0.05. It's $0.0295 now.~~". It's tried even if the confirmation's posting wasn't noted, eg.
+// above $0.05. It's now $0.0295.~~". It's tried even if the confirmation's posting wasn't noted, eg.
 // as the service restarted in between, since an edit can only reach the bot's own message with that
 // id. One saved before its text was kept is left as it is.
 fn struck_out(alert: &Alert) -> Option<(MessageId, String)> {
@@ -795,7 +795,7 @@ mod tests {
         let alert = alert("CHAT", Direction::Above, 0.05);
         assert_eq!(
             confirmation(&alert, 0.02946),
-            "I'll reply here when CHAT goes above $0.05. It's $0.02946 now."
+            "I'll reply here when CHAT goes above $0.05. It's now $0.02946."
         );
 
         // The reply shows whose alert it is, so it needn't mention them, unless it has no
@@ -806,17 +806,17 @@ mod tests {
         };
         assert_eq!(
             fired(&confirmed, 0.0512),
-            "CHAT is above $0.05: it's $0.0512 now."
+            "CHAT is above $0.05: it's now $0.0512."
         );
         assert_eq!(
             fired(&alert, 0.0512),
-            format!("@UserId({}) CHAT is above $0.05: it's $0.0512 now.", id(1))
+            format!("@UserId({}) CHAT is above $0.05: it's now $0.0512.", id(1))
         );
     }
 
     #[test]
     fn a_removed_alerts_confirmation_is_struck_out() {
-        let text = "I'll reply here when CHAT goes above $0.05. It's $0.0295 now.";
+        let text = "I'll reply here when CHAT goes above $0.05. It's now $0.0295.";
         let confirmed = Alert {
             confirmation_id: Some(70.into()),
             confirmation: Some(7),
@@ -1106,7 +1106,7 @@ mod tests {
         assert_eq!(kept[0].confirmation, Some(1));
         assert_eq!(
             kept[0].confirmation_text.as_deref(),
-            Some("I'll reply here when CHAT goes above $0.05. It's $0.0295 now.")
+            Some("I'll reply here when CHAT goes above $0.05. It's now $0.0295.")
         );
 
         let rules = set((
