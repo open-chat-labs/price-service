@@ -97,28 +97,27 @@ The period is optional and goes anywhere: `1d`, `7d` (the default), `30d`, `90d`
 `24h`, `1w`, `1m`, `3m`, `12m`. Up to 5 tokens can be charted at once. Symbols are matched ignoring
 case, and a leading `$` is ignored.
 
-The chart is posted as an image, which gives each token's price at the start of the period and
-now, and its change. A single token's chart also marks its high and low with their prices, unless
-one is the latest price, which has its own dot. Its caption credits where the prices came from. If
-a token can't be found, or there aren't enough prices for it, only whoever ran the command is told.
-
-![/chart CHAT ICP ckBTC 30d](./docs/example.png)
+The chart is a price chart message, which OpenChat draws, rather than an image. It shows each
+token's latest price and its change over the period, then the chart, where readers can see the
+price at any time by hovering over it, or pressing and dragging. A single token's chart marks its
+high and low. Under it, OpenChat credits where the prices came from. If a token can't be found, or
+there aren't enough prices for it, only whoever ran the command is told.
 
 - **Commands:** `/chart` has a single string parameter, so OpenChat passes everything typed after
   `/chart`, eg. `CHAT ICP 30d`, and the bot picks out the symbols and the period. With more than one
   parameter, OpenChat would split what's typed by spaces, one word per parameter.
-- **Drawing:** the chart is drawn with [plotters](https://crates.io/crates/plotters) as an SVG, then
-  rasterized to a PNG with [resvg](https://crates.io/crates/resvg), with the DejaVu Sans font built
-  in, so it needs nothing installed on the host. Its times are in UTC.
-- **Uploading:** the PNG is uploaded to OpenChat's storage, as the bot, with the
-  [Rust SDK](https://github.com/open-chat-labs/open-chat-bots)'s `Client::upload_image`, then sent as
-  an image message.
-  - OpenChat gives a bot an upload allowance of 1 GB when it's registered. A chart is about
-    40-90 KB, so that's roughly 15,000 charts, after which uploads fail.
-  - A group's or community's files are only deleted with it.
-- **Credits:** the image's caption credits every source its prices came from, linked, eg. "Price
-  data by ICPSwap and CoinGecko". It's in the caption, rather than the image, as an image can't
-  link, and CoinGecko's free API requires a linked credit.
+- **The message:** the [Rust SDK](https://github.com/open-chat-labs/open-chat-bots)'s
+  `MessageContentInitial::PriceChart`, which needs the Image permission. It has each token's prices,
+  its ledger or CoinGecko id, and a title, eg. "CHAT, ICP and ckBTC · 30 days", which is the
+  chart's text in notifications, previews and search.
+- **OpenChat's limits:** it refuses a chart with more than 1,000 points across its tokens, so each
+  token gets an equal share, eg. 200 each of 5. A token with more, eg. a coin's 90 days of hourly
+  prices, is thinned to its first and latest prices and the high and low of each stretch between,
+  so the line keeps its shape and its high and low are where they were. It would refuse a price
+  that isn't above 0 too, which is left out, and a symbol over 20 characters, a name over 50 or a
+  title over 100, which are cut short.
+- **Credits:** the chart names every source its prices came from, which OpenChat credits under it,
+  linked, eg. "Price data by ICPSwap and CoinGecko", as CoinGecko's free API requires.
 
 ## Where ChartBot's prices come from
 
@@ -275,7 +274,7 @@ It's a long-running server, so the prices it caches are shared between requests.
      [`docs/alert-bot-avatar.svg`](./docs/alert-bot-avatar.svg): ChartBot's line, crossing a target.
 
 4. **Install it** in a group, community or direct chat, granting it the permission to send text
-   and image messages.
+   and image messages. A price chart needs the image one.
    - Install PriceAlertBot in a group or community, granting it the permission to send text
      messages.
 
@@ -289,9 +288,8 @@ With OpenChat running locally from a checkout of
 ```
 
 It makes `chart_bot` and `price_alert_bot` identities if there aren't any, and prints each bot's
-principal and endpoint to register it with: ChartBot's on port 3002, and PriceAlertBot's on 3003. It
-reads the local StorageIndex's id from the `open-chat` checkout, or from the checkout
-`OPEN_CHAT_DIR` names. The alerts are kept in `target/local-price-alerts.json`.
+principal and endpoint to register it with: ChartBot's on port 3002, and PriceAlertBot's on 3003.
+The alerts are kept in `target/local-price-alerts.json`.
 
 To see an alert fire, set one, then run the script again with a token priced as another, eg.
 `LEDGER_ALIASES=<local CHAT>=ryjl3-tyaaa-aaaaa-aaaba-cai` prices CHAT as ICP.
@@ -421,7 +419,7 @@ managed through SSM.
 | `ALERTS_FILE` | Where PriceAlertBot keeps its alerts. Defaults to `price-alerts.json` |
 | `COINGECKO_API_KEY` | Optional, but worth having in production. A CoinGecko Demo API key, which is free, for a higher rate limit than its public API's. The coins' refresh uses about 7,200 of its 10,000 calls a month. Its prices must be credited where they're shown, which the API's `sources` says. |
 | `PORT` | Defaults to 3000, or 8080 in the container |
-| `OC_IC_URL`, `OC_PUBLIC_KEY`, `OC_STORAGE_INDEX` | Only to use an OpenChat other than mainnet's |
+| `OC_IC_URL`, `OC_PUBLIC_KEY` | Only to use an OpenChat other than mainnet's |
 | `LEDGER_ALIASES` | Only locally: `local=mainnet` ledger pairs, separated by commas, to price local ledgers as mainnet ones |
 | `ALERT_BOT_PORT` | Only locally: a port to serve PriceAlertBot on as well, at its root, as an origin of its own |
 | `RUST_LOG` | Log level, eg. `info` (the default) |
