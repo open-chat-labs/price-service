@@ -50,8 +50,8 @@ async fn main() -> Result<()> {
     prices::spawn_refresh(market.clone(), icpswap.clone(), coingecko.clone(), mainnet);
 
     let prices = Arc::new(Prices::new(market.clone(), coingecko, icpswap));
-    let chart_commands = CommandHandlerRegistry::new(chart_bot.client_factory)
-        .register(Chart::new(prices.clone(), config.storage_index));
+    let chart_commands =
+        CommandHandlerRegistry::new(chart_bot.client_factory).register(Chart::new(prices.clone()));
     let chart_routes = bot::routes(
         chart_bot::definition(chart_commands.definitions()),
         config.oc_public_key.clone(),
