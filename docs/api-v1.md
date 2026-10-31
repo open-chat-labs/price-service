@@ -182,6 +182,8 @@ These are the frontend mappers, `frontend/openchat-agent/src/services/priceServi
   - It needs `prices` as an object of `{ usd: number }`. `timestamp` isn't checked.
   - Entries for ledgers outside the Registry, and `usd` values that aren't positive finite numbers,
     are dropped.
+  - Each entry in `sources` needs `name` and an https `token_url`. One that doesn't have them is
+    dropped, along with every coin credited to it, as its price mustn't be shown uncredited.
   - A response that doesn't parse, or any non-2xx status, means the frontend keeps its last prices.
 - **`/history`**
   - It needs `points` as an array of `[number, number]`. The other fields aren't checked.
