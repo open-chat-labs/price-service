@@ -60,6 +60,15 @@ impl Source {
             Source::CoinGecko(_) => Provider::CoinGecko,
         }
     }
+
+    /// The token's page at its provider
+    pub fn url(&self) -> String {
+        let id = match self {
+            Source::Icp(ledger) => ledger.to_string(),
+            Source::CoinGecko(id) => id.clone(),
+        };
+        self.provider().token_url().replace("{id}", &id)
+    }
 }
 
 /// A service the prices come from, and how it's credited where they're shown
@@ -87,11 +96,20 @@ impl Provider {
         }
     }
 
-    /// Where a credit links to
+    /// Where a credit links to, unless it's for one token
     pub fn url(self) -> &'static str {
         match self {
             Provider::IcpSwap => "https://www.icpswap.com",
             Provider::CoinGecko => "https://www.coingecko.com",
+        }
+    }
+
+    /// Where a credit for one token links to, with `{id}` for its ledger or CoinGecko id. A CoinGecko
+    /// id needn't be its page's name, eg. XRP's is ripple, but CoinGecko redirects to the page.
+    pub fn token_url(self) -> &'static str {
+        match self {
+            Provider::IcpSwap => "https://app.icpswap.com/info-tokens/details/{id}",
+            Provider::CoinGecko => "https://www.coingecko.com/en/coins/{id}",
         }
     }
 
@@ -172,6 +190,11 @@ impl Prices {
         Ok(token)
     }
 
+    /// Whether the token's a stablecoin, priced at $1 rather than from its source
+    pub fn is_pinned(&self, token: &Token) -> bool {
+        matches!(&token.source, Source::Icp(ledger) if self.market.is_pinned(*ledger))
+    }
+
     /// The token's prices over the period, oldest first, the last being the latest
     pub async fn history(
         &self,
@@ -179,7 +202,7 @@ impl Prices {
         period: Period,
     ) -> Result<Vec<PricePoint>, PriceError> {
         let now = now();
-        let pinned = matches!(&token.source, Source::Icp(ledger) if self.market.is_pinned(*ledger));
+        let pinned = self.is_pinned(token);
         // The market has the last week or so of the tokens OpenChat lists and the largest coins,
         // and has stablecoins at $1 for any period
         let up_to_a_week = if period.days() <= 7 || pinned {

@@ -225,11 +225,13 @@ mod tests {
                 "coingecko": {
                     "name": "CoinGecko",
                     "url": "https://www.coingecko.com",
+                    "token_url": "https://www.coingecko.com/en/coins/{id}",
                     "attribution_required": true,
                 },
                 "icpswap": {
                     "name": "ICPSwap",
                     "url": "https://www.icpswap.com",
+                    "token_url": "https://app.icpswap.com/info-tokens/details/{id}",
                     "attribution_required": false,
                 },
             })

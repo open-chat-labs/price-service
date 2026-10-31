@@ -23,9 +23,10 @@ url from its build's `OC_PRICE_SERVICE_URL`.
   - **When coins are stale:** `coins` is left out, rather than failing the whole response.
   - **`source`:** where each price is from, `icpswap` or `coingecko`. Stablecoins have none, as
     they're priced at $1.
-  - **`sources`:** each source's `name` and `url`, and whether its prices must be credited where
+  - **`sources`:** each source's `name` and `url`, its `token_url` for a credit of one token, with
+    `{id}` for the token's ledger or CoinGecko id, and whether its prices must be credited where
     they're shown (`attribution_required`). CoinGecko's must be, as its free API requires, eg.
-    "Price data by CoinGecko" linking to its `url`, close to the price. See
+    "Price data by CoinGecko" linking to CoinGecko, close to the price. See
     [the spec](./docs/api-v1.md#additions-where-prices-come-from-and-crediting-coingecko).
 
   ```json
@@ -33,8 +34,10 @@ url from its build's `OC_PRICE_SERVICE_URL`.
     "prices": { "2ouva-viaaa-aaaaq-aaamq-cai": { "usd": 0.0308548, "source": "icpswap" } },
     "coins": { "ADA": { "id": "cardano", "name": "Cardano", "usd": 0.204927, "source": "coingecko" } },
     "sources": {
-      "coingecko": { "name": "CoinGecko", "url": "https://www.coingecko.com", "attribution_required": true },
-      "icpswap": { "name": "ICPSwap", "url": "https://www.icpswap.com", "attribution_required": false } } }
+      "coingecko": { "name": "CoinGecko", "url": "https://www.coingecko.com",
+        "token_url": "https://www.coingecko.com/en/coins/{id}", "attribution_required": true },
+      "icpswap": { "name": "ICPSwap", "url": "https://www.icpswap.com",
+        "token_url": "https://app.icpswap.com/info-tokens/details/{id}", "attribution_required": false } } }
   ```
 
 - **`GET /v1/prices/{ledger}/history?range=7d`:** one token's hourly closes, oldest first, as
@@ -117,7 +120,8 @@ there aren't enough prices for it, only whoever ran the command is told.
   that isn't above 0 too, which is left out, and a symbol over 20 characters, a name over 50 or a
   title over 100, which are cut short.
 - **Credits:** the chart names every source its prices came from, which OpenChat credits under it,
-  linked, eg. "Price data by ICPSwap and CoinGecko", as CoinGecko's free API requires.
+  linked, eg. "Price data by ICPSwap and CoinGecko", as CoinGecko's free API requires. A chart of
+  one token links to its page there, unless it's a stablecoin, whose page may show another price.
 
 ## Where ChartBot's prices come from
 

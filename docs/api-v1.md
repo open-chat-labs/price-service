@@ -146,8 +146,18 @@ where it's from, and the website credits the source beside it. These are additio
 
   ```json
   "sources": {
-    "coingecko": { "name": "CoinGecko", "url": "https://www.coingecko.com", "attribution_required": true },
-    "icpswap": { "name": "ICPSwap", "url": "https://www.icpswap.com", "attribution_required": false }
+    "coingecko": {
+      "name": "CoinGecko",
+      "url": "https://www.coingecko.com",
+      "token_url": "https://www.coingecko.com/en/coins/{id}",
+      "attribution_required": true
+    },
+    "icpswap": {
+      "name": "ICPSwap",
+      "url": "https://www.icpswap.com",
+      "token_url": "https://app.icpswap.com/info-tokens/details/{id}",
+      "attribution_required": false
+    }
   }
   ```
 
@@ -155,7 +165,9 @@ where it's from, and the website credits the source beside it. These are additio
   those prices:
   - visibly, close to the prices, eg. just below a cashtag card's chart;
   - in one of CoinGecko's wordings, eg. "Price data by CoinGecko";
-  - linking to `url`.
+  - linking to `url`, or for a credit of one token, to `token_url` with `{id}` replaced by its
+    ledger or CoinGecko id. CoinGecko's guide links its wordings to its home page, so a coin's page
+    is our own choice, which sends readers to the coin they're looking at.
   - Not once per price: CoinGecko asks not to overload a page with credits. How to credit the
     prices on cashtag chips in a message is the website's call.
   - It mustn't suggest a partnership or endorsement, eg. "Our partner CoinGecko". See CoinGecko's
@@ -170,6 +182,8 @@ These are the frontend mappers, `frontend/openchat-agent/src/services/priceServi
   - It needs `prices` as an object of `{ usd: number }`. `timestamp` isn't checked.
   - Entries for ledgers outside the Registry, and `usd` values that aren't positive finite numbers,
     are dropped.
+  - Each entry in `sources` needs `name` and an https `token_url`. One that doesn't have them is
+    dropped, along with every coin credited to it, as its price mustn't be shown uncredited.
   - A response that doesn't parse, or any non-2xx status, means the frontend keeps its last prices.
 - **`/history`**
   - It needs `points` as an array of `[number, number]`. The other fields aren't checked.

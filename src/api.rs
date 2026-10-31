@@ -56,8 +56,10 @@ struct CoinPrice {
 struct SourceInfo {
     name: &'static str,
     url: &'static str,
-    /// Its prices must be credited, eg. "Price data by CoinGecko" linking to `url`, wherever
-    /// they're shown
+    /// What a credit for one token links to instead, with `{id}` for its ledger or CoinGecko id
+    token_url: &'static str,
+    /// Its prices must be credited, eg. "Price data by CoinGecko" linking to it, wherever they're
+    /// shown
     attribution_required: bool,
 }
 
@@ -167,6 +169,7 @@ fn sources() -> BTreeMap<&'static str, SourceInfo> {
             let info = SourceInfo {
                 name: provider.name(),
                 url: provider.url(),
+                token_url: provider.token_url(),
                 attribution_required: provider.attribution_required(),
             };
             (provider.id(), info)
