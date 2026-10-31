@@ -215,12 +215,15 @@ fn price_chart(
             })
             .collect(),
         // OpenChat credits them under the chart, linked, eg. "Price data by ICPSwap and
-        // CoinGecko", as CoinGecko requires
+        // CoinGecko", as CoinGecko requires. One token's credit links to that token's page there.
         sources: providers(charted)
             .into_iter()
             .map(|p| PriceChartSource {
                 name: p.name().to_string(),
-                url: p.url().to_string(),
+                url: match charted {
+                    [(token, _)] => token.source.url(),
+                    _ => p.url().to_string(),
+                },
             })
             .collect(),
     }
@@ -409,6 +412,42 @@ mod tests {
                 ("ICPSwap", "https://www.icpswap.com"),
                 ("CoinGecko", "https://www.coingecko.com")
             ]
+        );
+    }
+
+    #[test]
+    fn several_tokens_from_one_source_link_to_the_source() {
+        let charted = vec![
+            (token("BTC"), hourly(&[1.0, 2.0])),
+            (token("ADA"), hourly(&[1.0, 2.0])),
+        ];
+        let chart = price_chart(&charted, Period::Week, NOW);
+        assert_eq!(chart.sources.len(), 1);
+        assert_eq!(chart.sources[0].url, "https://www.coingecko.com");
+    }
+
+    #[test]
+    fn one_token_links_to_its_page() {
+        let chart = price_chart(&[(token("BTC"), hourly(&[1.0, 2.0]))], Period::Week, NOW);
+        assert_eq!(chart.sources.len(), 1);
+        assert_eq!(chart.sources[0].name, "CoinGecko");
+        assert_eq!(
+            chart.sources[0].url,
+            "https://www.coingecko.com/en/coins/btc"
+        );
+
+        let chart = price_chart(
+            &[(icp_token("CHAT"), hourly(&[1.0, 2.0]))],
+            Period::Week,
+            NOW,
+        );
+        assert_eq!(chart.sources[0].name, "ICPSwap");
+        assert_eq!(
+            chart.sources[0].url,
+            format!(
+                "https://app.icpswap.com/info-tokens/details/{}",
+                Principal::anonymous()
+            )
         );
     }
 

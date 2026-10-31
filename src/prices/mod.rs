@@ -60,6 +60,15 @@ impl Source {
             Source::CoinGecko(_) => Provider::CoinGecko,
         }
     }
+
+    /// The token's page at its provider
+    pub fn url(&self) -> String {
+        let id = match self {
+            Source::Icp(ledger) => ledger.to_string(),
+            Source::CoinGecko(id) => id.clone(),
+        };
+        self.provider().token_url().replace("{id}", &id)
+    }
 }
 
 /// A service the prices come from, and how it's credited where they're shown
@@ -92,6 +101,15 @@ impl Provider {
         match self {
             Provider::IcpSwap => "https://www.icpswap.com",
             Provider::CoinGecko => "https://www.coingecko.com",
+        }
+    }
+
+    /// Where a credit for one token links to, with `{id}` for its ledger or CoinGecko id. A CoinGecko
+    /// id needn't be its page's name, eg. XRP's is ripple, but CoinGecko redirects to the page.
+    pub fn token_url(self) -> &'static str {
+        match self {
+            Provider::IcpSwap => "https://app.icpswap.com/info-tokens/details/{id}",
+            Provider::CoinGecko => "https://www.coingecko.com/en/coins/{id}",
         }
     }
 

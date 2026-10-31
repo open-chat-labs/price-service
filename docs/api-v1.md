@@ -146,8 +146,18 @@ where it's from, and the website credits the source beside it. These are additio
 
   ```json
   "sources": {
-    "coingecko": { "name": "CoinGecko", "url": "https://www.coingecko.com", "attribution_required": true },
-    "icpswap": { "name": "ICPSwap", "url": "https://www.icpswap.com", "attribution_required": false }
+    "coingecko": {
+      "name": "CoinGecko",
+      "url": "https://www.coingecko.com",
+      "token_url": "https://www.coingecko.com/en/coins/{id}",
+      "attribution_required": true
+    },
+    "icpswap": {
+      "name": "ICPSwap",
+      "url": "https://www.icpswap.com",
+      "token_url": "https://app.icpswap.com/info-tokens/details/{id}",
+      "attribution_required": false
+    }
   }
   ```
 
@@ -155,7 +165,8 @@ where it's from, and the website credits the source beside it. These are additio
   those prices:
   - visibly, close to the prices, eg. just below a cashtag card's chart;
   - in one of CoinGecko's wordings, eg. "Price data by CoinGecko";
-  - linking to `url`.
+  - linking to `url`, or for a credit of one token, to `token_url` with `{id}` replaced by its
+    ledger or CoinGecko id.
   - Not once per price: CoinGecko asks not to overload a page with credits. How to credit the
     prices on cashtag chips in a message is the website's call.
   - It mustn't suggest a partnership or endorsement, eg. "Our partner CoinGecko". See CoinGecko's
