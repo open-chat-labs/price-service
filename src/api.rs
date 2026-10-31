@@ -58,8 +58,8 @@ struct SourceInfo {
     url: &'static str,
     /// What a credit for one token links to instead, with `{id}` for its ledger or CoinGecko id
     token_url: &'static str,
-    /// Its prices must be credited, eg. "Price data by CoinGecko" linking to `url`, wherever
-    /// they're shown
+    /// Its prices must be credited, eg. "Price data by CoinGecko" linking to it, wherever they're
+    /// shown
     attribution_required: bool,
 }
 

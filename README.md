@@ -120,7 +120,8 @@ there aren't enough prices for it, only whoever ran the command is told.
   that isn't above 0 too, which is left out, and a symbol over 20 characters, a name over 50 or a
   title over 100, which are cut short.
 - **Credits:** the chart names every source its prices came from, which OpenChat credits under it,
-  linked, eg. "Price data by ICPSwap and CoinGecko", as CoinGecko's free API requires.
+  linked, eg. "Price data by ICPSwap and CoinGecko", as CoinGecko's free API requires. A chart of
+  one token links to its page there, unless it's a stablecoin, whose page may show another price.
 
 ## Where ChartBot's prices come from
 

@@ -125,7 +125,8 @@ impl Chart {
             ));
         }
 
-        let chart = price_chart(&charted, period, prices::now());
+        let is_pinned = |token: &Token| self.prices.is_pinned(token);
+        let chart = price_chart(&charted, is_pinned, period, prices::now());
         let (message, response) = oc_client
             .send_message(MessageContentInitial::PriceChart(chart))
             .execute_async_then_return_message()
@@ -178,6 +179,7 @@ impl Chart {
 // time by hovering over it, or pressing and dragging.
 fn price_chart(
     charted: &[(Token, Vec<PricePoint>)],
+    is_pinned: impl Fn(&Token) -> bool,
     period: Period,
     now: TimestampMillis,
 ) -> PriceChartContent {
@@ -215,13 +217,14 @@ fn price_chart(
             })
             .collect(),
         // OpenChat credits them under the chart, linked, eg. "Price data by ICPSwap and
-        // CoinGecko", as CoinGecko requires. One token's credit links to that token's page there.
+        // CoinGecko", as CoinGecko requires. One token's credit links to that token's page there,
+        // unless it's a stablecoin, which is drawn at $1 whatever its page says.
         sources: providers(charted)
             .into_iter()
             .map(|p| PriceChartSource {
                 name: p.name().to_string(),
                 url: match charted {
-                    [(token, _)] => token.source.url(),
+                    [(token, _)] if !is_pinned(token) => token.source.url(),
                     _ => p.url().to_string(),
                 },
             })
@@ -400,7 +403,7 @@ mod tests {
             (icp_token("CHAT"), hourly(&[1.0, 2.0])),
             (token("BTC"), hourly(&[1.0, 2.0])),
         ];
-        let chart = price_chart(&charted, Period::Week, NOW);
+        let chart = price_chart(&charted, |_| false, Period::Week, NOW);
         let sources: Vec<(&str, &str)> = chart
             .sources
             .iter()
@@ -421,14 +424,19 @@ mod tests {
             (token("BTC"), hourly(&[1.0, 2.0])),
             (token("ADA"), hourly(&[1.0, 2.0])),
         ];
-        let chart = price_chart(&charted, Period::Week, NOW);
+        let chart = price_chart(&charted, |_| false, Period::Week, NOW);
         assert_eq!(chart.sources.len(), 1);
         assert_eq!(chart.sources[0].url, "https://www.coingecko.com");
     }
 
     #[test]
     fn one_token_links_to_its_page() {
-        let chart = price_chart(&[(token("BTC"), hourly(&[1.0, 2.0]))], Period::Week, NOW);
+        let chart = price_chart(
+            &[(token("BTC"), hourly(&[1.0, 2.0]))],
+            |_| false,
+            Period::Week,
+            NOW,
+        );
         assert_eq!(chart.sources.len(), 1);
         assert_eq!(chart.sources[0].name, "CoinGecko");
         assert_eq!(
@@ -438,6 +446,7 @@ mod tests {
 
         let chart = price_chart(
             &[(icp_token("CHAT"), hourly(&[1.0, 2.0]))],
+            |_| false,
             Period::Week,
             NOW,
         );
@@ -452,12 +461,24 @@ mod tests {
     }
 
     #[test]
+    fn a_stablecoin_links_to_the_source_as_its_page_may_show_another_price() {
+        let chart = price_chart(
+            &[(icp_token("USDT"), hourly(&[1.0, 1.0]))],
+            |_| true,
+            Period::Week,
+            NOW,
+        );
+        assert_eq!(chart.sources[0].name, "ICPSwap");
+        assert_eq!(chart.sources[0].url, "https://www.icpswap.com");
+    }
+
+    #[test]
     fn each_token_is_its_ledger_or_its_coingecko_id() {
         let charted = vec![
             (icp_token("CHAT"), hourly(&[1.0, 2.0])),
             (token("ADA"), hourly(&[1.0, 2.0])),
         ];
-        let chart = price_chart(&charted, Period::Week, NOW);
+        let chart = price_chart(&charted, |_| false, Period::Week, NOW);
         assert!(matches!(
             chart.series[0].token,
             PriceChartToken::Ledger(l) if l == Principal::anonymous().into()
@@ -470,7 +491,7 @@ mod tests {
     #[test]
     fn a_chart_covers_its_period_up_to_now() {
         let charted = vec![(token("ADA"), hourly(&[1.0, 2.0]))];
-        let chart = price_chart(&charted, Period::Week, NOW);
+        let chart = price_chart(&charted, |_| false, Period::Week, NOW);
         assert_eq!(chart.start, NOW - Period::Week.millis());
         assert_eq!(chart.end, NOW);
     }
@@ -499,7 +520,7 @@ mod tests {
             },
         ];
         let charted = vec![(token("ADA"), before), (token("BTC"), after)];
-        let chart = price_chart(&charted, Period::Day, NOW);
+        let chart = price_chart(&charted, |_| false, Period::Day, NOW);
         assert_eq!((chart.start, chart.end), (start - 50, NOW + 20));
     }
 
@@ -509,7 +530,7 @@ mod tests {
             .iter()
             .map(|s| (token(s), hourly(&wavy(90 * 24))))
             .collect();
-        let chart = price_chart(&charted, Period::Quarter, NOW);
+        let chart = price_chart(&charted, |_| false, Period::Quarter, NOW);
         let total: usize = chart.series.iter().map(|s| s.points.len()).sum();
         assert!(total <= PriceChartContent::MAX_POINTS, "{total} points");
         assert!(chart.series.iter().all(|s| s.points.len() > 150));
@@ -542,7 +563,7 @@ mod tests {
             name: "A token with a name that's longer than OpenChat allows".to_string(),
             ..token("ABC")
         };
-        let chart = price_chart(&[(long, hourly(&[1.0, 2.0]))], Period::Week, NOW);
+        let chart = price_chart(&[(long, hourly(&[1.0, 2.0]))], |_| false, Period::Week, NOW);
         let name = &chart.series[0].name;
         assert_eq!(name.chars().count(), MAX_NAME_CHARS);
         assert!(name.ends_with("than OpenChat a…"), "{name}");
